@@ -1,5 +1,3 @@
-<div align="center">
-
 ![WorkBuddy Token 用量看板](web/src/assets/logo.jpg)
 
 # WorkBuddy Token 用量看板
