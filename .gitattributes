@@ -2,3 +2,5 @@
 * text=auto
 *.png binary
 *.jpg binary
+# Windows 批处理由 cmd.exe 逐行解析，LF-only 会把注释当成命令执行；checkout 时强制 CRLF
+*.bat text eol=crlf

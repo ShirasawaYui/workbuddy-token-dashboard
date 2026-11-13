@@ -1,11 +1,13 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { api } from './api.js';
 import { fmtNum, fmtTime } from './utils/format.js';
 import { pickGranularity, spanDaysOf } from './utils/granularity.js';
 import { loadFilter, saveFilter, sanitizeFilter } from './composables/useFilterStorage.js';
+import { RELATIVE_PRESETS, rangeOfPreset, toDayStr } from './utils/ranges.js';
 import FilterBar from './components/FilterBar.vue';
 import SessionDrawer from './components/SessionDrawer.vue';
+import ActiveSessionBar from './components/ActiveSessionBar.vue';
 import Overview from './views/Overview.vue';
 import Sessions from './views/Sessions.vue';
 import Requests from './views/Requests.vue';
@@ -21,22 +23,142 @@ const meta = ref({});
 const loading = ref(false);
 const openSessionId = ref('');
 
+/* ---------- 阶段 2：暖砂亮色 / 焦茶暗色双主题切换 ---------- */
+const THEME_KEY = 'wb-token-dashboard:theme:v1';
+const isDark = ref(false);
+function applyTheme(dark) {
+  isDark.value = !!dark;
+  if (typeof document !== 'undefined') {
+    document.documentElement.setAttribute('data-theme', isDark.value ? 'dark' : 'light');
+  }
+  try {
+    localStorage.setItem(THEME_KEY, isDark.value ? 'dark' : 'light');
+  } catch {
+    /* 隐私模式下忽略 */
+  }
+}
+try {
+  const savedTheme = localStorage.getItem(THEME_KEY);
+  applyTheme(savedTheme === 'dark');
+} catch {
+  applyTheme(false);
+}
+function toggleTheme() {
+  applyTheme(!isDark.value);
+}
+
 /* 上次的筛选条件：从 localStorage 恢复（只在当天有效，见 useFilterStorage 的注释） */
 const boot = loadFilter();
 const filter = ref(boot.filter);
 /** 是否确实沿用了一份存下来的筛选 —— 顶栏要给个可见的交代 */
 const restoredHint = ref(boot.restored);
 
+/* ---------- 阶段 1：跨零点 / 历史加载提示 / stale 的共享状态 ---------- */
+/** 自动刷新是否 stale（上一拍取数失败）；与历史加载提示共用一处容器，且 stale 优先 */
+const pollStale = ref(false);
+/** 是否成功连上过解析服务：服务从未启动（meta 为空）时不常驻显示任何状态提示 */
+const connected = computed(() => !!meta.value?.projectsDir && !meta.value?.error);
+/** 历史数据加载提示：'' 无 | 'loading' 正在读取 | 'failed' 读取未成功 */
+const historyState = ref('');
+let historyTimer = null;
+let historySeq = 0;
+/** 页面打开那天的本地日期串，用于跨零点检测 */
+let lastDayStr = toDayStr(new Date());
+
+/** 稳定态 / 历史加载 / stale 统一一处容器按优先级显示，避免互抢（stale 优先） */
+const banner = computed(() => {
+  if (connected.value && pollStale.value) {
+    return { kind: 'stale', text: '自动刷新未成功，显示上一拍数据' };
+  }
+  if (historyState.value === 'failed') {
+    return { kind: 'failed', text: '历史数据读取未成功，可重试' };
+  }
+  if (historyState.value === 'loading') {
+    return { kind: 'loading', text: '正在读取历史数据…' };
+  }
+  return null;
+});
+
 /** 用户动了筛选：从这一刻起就不再是"沿用"，把提示收掉 */
 function onFilter(next) {
+  const prev = filter.value;
   filter.value = next;
   restoredHint.value = false;
+  maybeShowHistoryLoading(next, prev);
+}
+
+/**
+ * loadFilter() 只在启动时调一次；页面跨零点一直开着时，相对档位的 from/to
+ * 会停在昨天零点（标签写「今天」却筛出「昨天 + 今天」）。
+ * poll() 每拍与切回前台都会经过这里：日期变了就按 preset 重算区间，
+ * 换一个新对象让各视图 watch 触发一次刷新（复用既有链路，不动 revision 门控）。
+ */
+function syncDayBoundary() {
+  const today = toDayStr(new Date());
+  if (today === lastDayStr) return;
+  lastDayStr = today;
+  const f = filter.value;
+  if (!RELATIVE_PRESETS.includes(f.preset)) return;
+  filter.value = { ...f, ...rangeOfPreset(f.preset) };
+}
+
+/* ---------- 历史数据加载提示（4.3） ----------
+   切到更宽档位时前端先亮提示；服务端会在 handler 里 await ensureLoaded，
+   该请求返回时数据已是新版本，不需要再做一次 revision 换数。
+   当前视图数据不清空、不闪空态，提示只是独立的一条 banner。 */
+
+/** 区间起点排序键：空 = 不限 = 最早（最宽）；否则用 YYYYMMDD 数字比较 */
+function startKey(f) {
+  return f.from ? Number(f.from.replace(/-/g, '')) : 0;
+}
+/** 前端预测：新范围是否比旧范围宽（起点更早 / 由限定变不限） */
+function isWiderRange(next, prev) {
+  const ns = startKey(next);
+  const ps = startKey(prev);
+  if (ns !== ps) return ns < ps;
+  return !!prev.to && !next.to;
+}
+
+/**
+ * 触发用任务给的近似口径：范围变宽 且 还有未加载文件；fullLoad 时不显示。
+ * meta 为空对象（服务未启动）时 loadedFiles/totalFiles 缺失，条件不成立 → 不常驻。
+ */
+function maybeShowHistoryLoading(next, prev) {
+  const m = meta.value || {};
+  if (m.fullLoad) return;
+  if (!(Number(m.loadedFiles) < Number(m.totalFiles))) return;
+  if (next.from === prev.from && next.to === prev.to) return; // 只改项目/模型/关键词，不涉及范围
+  if (!isWiderRange(next, prev)) return;
+  showHistoryLoading();
+}
+
+function showHistoryLoading() {
+  const seq = ++historySeq;
+  historyState.value = 'loading';
+  clearTimeout(historyTimer);
+  // 15s 兜底：请求失败或一直不返回也不能让提示常驻
+  historyTimer = setTimeout(() => finishHistoryLoading(seq, true), 15000);
+  // nextTick 后各视图因 filter 变化发出的 GET 已在途，等它们全部落地再撤销
+  nextTick(async () => {
+    await api.whenIdle();
+    finishHistoryLoading(seq, false);
+  });
+}
+
+function finishHistoryLoading(seq, timedOut) {
+  if (seq !== historySeq) return; // 已被更新的切档覆盖
+  clearTimeout(historyTimer);
+  historyTimer = null;
+  if (historyState.value !== 'loading') return;
+  // 请求落地后当前视图仍报 error（needsRetry）→ 判定读取未成功；超时只做撤销
+  historyState.value = !timedOut && currentView()?.needsRetry?.() ? 'failed' : '';
 }
 
 const overviewRef = ref(null);
 const sessionsRef = ref(null);
 const requestsRef = ref(null);
 const drawerRef = ref(null);
+const activeRef = ref(null);
 
 /**
  * 前端自动取数间隔，与服务端扫描间隔（SCAN_INTERVAL_MS，默认 5s）对齐，
@@ -45,6 +167,38 @@ const drawerRef = ref(null);
 const AUTO_REFRESH_MS = 5000;
 let timer = null;
 let saveTimer = null;
+/** 自动刷新自己的 in-flight 锁：loading 只覆盖手动刷新，挡不住两个 poll 叠加 */
+let pollInFlight = false;
+/** 手动刷新等待当前 poll 完全收尾，而不是只等它此刻已经发出的某个 GET。 */
+const pollWaiters = new Set();
+/**
+ * 上一拍的数据版本。revision 只在后端 rebuild（有新记录）时 +1，
+ * 因此它没变就说明这一拍没有任何新数据 —— 整拍跳过视图重取与重绘。
+ * 初始 -1 保证首次 poll 会完整加载一次。
+ */
+let lastRevision = -1;
+
+function currentView() {
+  return { overview: overviewRef, sessions: sessionsRef, requests: requestsRef }[tab.value]?.value;
+}
+
+/** revision 只表达「服务端变了」；本地一次取数失败也必须能在下一拍重试。 */
+function needsRetry() {
+  return !!(
+    currentView()?.needsRetry?.() ||
+    (openSessionId.value && drawerRef.value?.needsRetry?.()) ||
+    activeRef.value?.needsRetry?.()
+  );
+}
+
+/** 返回 false 时绝不能提交 revision，否则后续 poll 会把失败那一拍当成已完成。 */
+async function syncData() {
+  let ok = true;
+  if ((await currentView()?.reload()) === false) ok = false;
+  if (openSessionId.value && (await drawerRef.value?.reload()) === false) ok = false;
+  if ((await activeRef.value?.reload()) === false) ok = false;
+  return ok;
+}
 
 async function loadMeta() {
   try {
@@ -62,10 +216,13 @@ async function loadMeta() {
 async function refresh() {
   loading.value = true;
   try {
+    if (pollInFlight) await new Promise((resolve) => pollWaiters.add(resolve));
     await api.refresh();
     await loadMeta();
-    const map = { overview: overviewRef, sessions: sessionsRef, requests: requestsRef };
-    await map[tab.value].value?.reload();
+    // 手动刷新一律强制重取；只有全部成功才提交版本，失败留给下一拍重试。
+    if (await syncData()) lastRevision = meta.value.revision ?? -1;
+  } catch (e) {
+    console.error('[手动刷新] 失败：', e);
   } finally {
     loading.value = false;
   }
@@ -78,15 +235,30 @@ async function refresh() {
  * 自动这一路只负责把服务端已经扫好的结果拉下来，两边职责分开。
  */
 async function poll() {
+  syncDayBoundary(); // 跨零点：poll 每拍与 visibilitychange 回前台都会经过这里
   if (document.hidden) return; // 切到后台就停，回来时补一拍
   if (loading.value) return; // 上一拍还没回来（比如刚点过刷新），跳过
-  const map = { overview: overviewRef, sessions: sessionsRef, requests: requestsRef };
+  if (pollInFlight) return; // 定时器与 visibilitychange 补拍撞在一起时也只跑一次
+  pollInFlight = true;
   try {
-    meta.value = await api.meta();
-    await map[tab.value].value?.reload();
-    if (openSessionId.value) await drawerRef.value?.reload();
-  } catch {
-    /* 网络抖动跳过这一拍，下一拍再试，不要把页面顶成错误态 */
+    const next = await api.meta();
+    meta.value = next;
+    pollStale.value = false;
+    // 稳定态仍只花一个 /api/meta；但「上一拍失败 / 目标还没同步」不属于稳定态，
+    // 即使 revision 没变也必须补拍，否则一次短暂 503 就会让页面永久停在旧数据。
+    // 这里刻意不调 sanitizeFilter：poll 每拍都跑，若在此改 filter 会再触发
+    // 各视图 watch 取数形成请求链。渐进补全期间的 sanitize 只在 loadMeta() /
+    // refresh() 做，行为差异见 useFilterStorage.sanitizeFilter 的注释。
+    if (next.revision === lastRevision && !needsRetry()) return;
+    if (await syncData()) lastRevision = next.revision ?? -1;
+  } catch (e) {
+    pollStale.value = true;
+    /* 网络抖动跳过这一拍，下一拍再试；不要把页面顶成错误态，但要留痕 */
+    console.warn('[自动刷新] 本拍取数失败，保留上一拍数据：', e);
+  } finally {
+    pollInFlight = false;
+    for (const resolve of pollWaiters) resolve();
+    pollWaiters.clear();
   }
 }
 
@@ -94,6 +266,11 @@ async function poll() {
 function onVisibilityChange() {
   if (!document.hidden) poll();
 }
+
+/* poll 只刷新当前页签；切到另一个已挂载页签时必须主动补齐，不能等下一次数据变更。 */
+watch(tab, () => {
+  currentView()?.reload();
+});
 
 onMounted(() => {
   loadMeta();
@@ -104,6 +281,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   clearInterval(timer);
   clearTimeout(saveTimer);
+  clearTimeout(historyTimer);
   document.removeEventListener('visibilitychange', onVisibilityChange);
 });
 
@@ -126,6 +304,7 @@ watch(
  * （从"近 7 天"切到"今天"，按天只剩 1 根柱子）。
  * 在这里统一兜正，省得用户改完区间还要手动再点一次粒度。
  * 阈值口径与禁用哪些档位都在 utils/granularity.js，FilterBar 共用同一套。
+ * meta.minTs 后端已保证稳定，这里不新增依赖它的额外请求。
  */
 watch(
   () => [filter.value.from, filter.value.to, filter.value.granularity, meta.value.minTs],
@@ -138,91 +317,115 @@ watch(
 </script>
 
 <template>
-  <!-- 动态背景：主光 + 补光 + 暗角 + 细颗粒，给玻璃提供可折射的内容 -->
-  <div class="aurora" aria-hidden="true">
-    <div class="layer light-key" />
-    <div class="layer light-fill" />
-    <div class="layer vignette" />
-    <div class="grain" />
-  </div>
-  <div class="aurora-fade" aria-hidden="true" />
-
+  <!-- 阶段 2：左侧固定导航栏 (Sidebar) + 右侧 100% 自适应全宽工作台 -->
   <div class="app">
-    <!-- 顶栏：悬浮玻璃条 -->
-    <header class="topbar glass">
-      <div class="brand">
-        <div class="logo" role="img" aria-label="白熊图标" />
-        <div class="brand-text">
-          <div class="brand-title">WorkBuddy Token 用量看板</div>
-          <div class="brand-sub mono">{{ meta.error ? '未连接到解析服务' : meta.projectsDir || '读取中…' }}</div>
+    <aside class="sidebar">
+      <div class="brand-row">
+        <div class="brand">
+          <div class="logo" role="img" aria-label="白熊图标" />
+          <div class="brand-text">
+            <div class="brand-title">WorkBuddy Token 用量看板</div>
+            <div class="brand-sub mono" :title="meta.projectsDir">
+              {{ meta.error ? '未连接到解析服务' : meta.projectsDir || '读取中…' }}
+            </div>
+          </div>
         </div>
+        <button
+          class="theme-btn"
+          type="button"
+          :title="isDark ? '切换为暖砂亮色主题' : '切换为深焙黑曜石暗色主题'"
+          @click="toggleTheme"
+        >
+          {{ isDark ? '🌙' : '☀️' }}
+        </button>
       </div>
 
-      <nav class="tabs seg">
-        <button
-          v-for="t in TABS"
-          :key="t.key"
-          class="seg-btn tab"
-          :class="{ on: tab === t.key }"
-          @click="tab = t.key"
-        >
-          {{ t.label }}
-        </button>
-      </nav>
+      <div class="nav-block">
+        <div class="nav-label">工作台视图</div>
+        <nav class="tabs seg">
+          <button
+            v-for="t in TABS"
+            :key="t.key"
+            class="seg-btn tab"
+            :class="{ on: tab === t.key }"
+            @click="tab = t.key"
+          >
+            {{ t.label }}
+          </button>
+        </nav>
+      </div>
+
+      <!-- 最近活跃摘要卡：内嵌在左侧栏随时盯盘，同时释放右侧首屏垂直空间 -->
+      <div class="active-block">
+        <div class="nav-label">实时盯盘</div>
+        <ActiveSessionBar
+          ref="activeRef"
+          :meta="meta"
+          @open-session="openSessionId = $event"
+        />
+      </div>
 
       <div class="stats">
-        <div class="stat">
-          <span class="stat-k">请求</span>
-          <span class="stat-v num">{{ fmtNum(meta.recordCount || 0) }}</span>
+        <div class="stats-grid">
+          <div class="stat">
+            <span class="stat-k">累计请求</span>
+            <span class="stat-v num">{{ fmtNum(meta.recordCount || 0) }}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">累计会话</span>
+            <span class="stat-v num">{{ fmtNum(meta.sessionCount || 0) }}</span>
+          </div>
         </div>
-        <div class="stat">
-          <span class="stat-k">会话</span>
-          <span class="stat-v num">{{ fmtNum(meta.sessionCount || 0) }}</span>
+        <div class="stats-foot">
+          <span class="dot" title="解析服务正常" />
+          <span class="auto-hint" title="页面每 5 秒自动拉取最新数据（切到后台会暂停）">自动刷新 5s</span>
+          <span class="scan-at num mono">{{ meta.lastScanAt ? fmtTime(meta.lastScanAt, false) : '-' }}</span>
         </div>
-        <div class="stat">
-          <span class="stat-k">最近扫描</span>
-          <span class="stat-v num">{{ meta.lastScanAt ? fmtTime(meta.lastScanAt, false) : '-' }}</span>
-        </div>
-        <span class="dot" title="解析服务正常" />
-        <span class="auto-hint" title="页面每 5 秒自动拉取最新数据（切到后台会暂停）">自动刷新 5s</span>
       </div>
-    </header>
+    </aside>
 
-    <!-- 筛选 -->
-    <section class="toolbar">
-      <FilterBar
-        :filter="filter"
-        :meta="meta"
-        :loading="loading"
-        :restored="restoredHint"
-        @update:filter="onFilter"
-        @dismiss-restored="restoredHint = false"
-        @refresh="refresh"
-      />
-    </section>
+    <!-- 右侧全宽自适应主工作台 -->
+    <div class="workspace">
+      <section class="toolbar">
+        <FilterBar
+          :filter="filter"
+          :meta="meta"
+          :loading="loading"
+          :restored="restoredHint"
+          @update:filter="onFilter"
+          @dismiss-restored="restoredHint = false"
+          @refresh="refresh"
+        />
+        <!-- 状态提示统一容器：stale 优先于历史加载 / 失败提示，避免互抢 -->
+        <div v-if="banner" class="status-banner glass" :class="'sb-' + banner.kind">
+          <span v-if="banner.kind === 'loading'" data-testid="history-loading">{{ banner.text }}</span>
+          <span v-else>{{ banner.text }}</span>
+        </div>
+      </section>
 
-    <!-- 内容 -->
-    <main class="content">
-      <Overview
-        v-show="tab === 'overview'"
-        ref="overviewRef"
-        :filter="filter"
-        :meta="meta"
-        @open-session="openSessionId = $event"
-      />
-      <Sessions
-        v-show="tab === 'sessions'"
-        ref="sessionsRef"
-        :filter="filter"
-        @open-session="openSessionId = $event"
-      />
-      <Requests
-        v-show="tab === 'requests'"
-        ref="requestsRef"
-        :filter="filter"
-        @open-session="openSessionId = $event"
-      />
-    </main>
+      <!-- 内容（直接子元素严格保持 [0]=总览、[1]=会话、[2]=明细） -->
+      <main class="content">
+        <Overview
+          v-show="tab === 'overview'"
+          ref="overviewRef"
+          :filter="filter"
+          :meta="meta"
+          @open-session="openSessionId = $event"
+        />
+        <Sessions
+          v-show="tab === 'sessions'"
+          ref="sessionsRef"
+          :filter="filter"
+          @open-session="openSessionId = $event"
+        />
+        <Requests
+          v-show="tab === 'requests'"
+          ref="requestsRef"
+          :filter="filter"
+          @open-session="openSessionId = $event"
+        />
+      </main>
+    </div>
   </div>
 
   <SessionDrawer
@@ -234,113 +437,206 @@ watch(
 </template>
 
 <style scoped>
+/* 全局左右分栏骨架：左侧固定 252px 侧栏 + 右侧 100% 自适应全宽工作台（不写死 max-width，2K 大屏自动铺满） */
 .app {
   position: relative;
   z-index: 1;
-  /* 不撑满整屏：居中 + 最大宽度 */
-  max-width: var(--shell-max);
-  margin: 0 auto;
-  padding: 18px var(--shell-pad) 44px;
+  display: grid;
+  grid-template-columns: 252px minmax(0, 1fr);
   min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+  width: 100%;
 }
 
-/* 悬浮玻璃顶栏：滚动时内容从玻璃后面穿过，玻璃感最明显 */
-.topbar {
+/* ---------- 左侧固定导航栏 (Sidebar) ---------- */
+.sidebar {
   position: sticky;
-  top: 14px;
-  z-index: 30;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border-hairline);
+  padding: 16px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.brand-row {
   display: flex;
   align-items: center;
-  gap: 20px;
-  padding: 11px 16px;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 11px;
-  flex: none;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
 }
 
-/*
-  品牌图标：直接用 src/assets/logo.jpg（白熊）。
-  原来是内联 SVG + indigo→sky→teal 的三色斜渐变，那是最典型的 AI 图标配色；
-  换成位图后这层渐变没有意义了（图不透明，底下什么都透不出来），
-  但**底色留着**——图加载失败时它就是兜底，不会变成一块空白。
-
-  另外保留内高光和圆角：图标和顶栏是同一套玻璃材质，
-  边缘没有这道高光就会像一张贴上去的贴纸。
-*/
+/* 品牌图标：保留 src/assets/logo.jpg（白熊） */
 .logo {
   width: 34px;
   height: 34px;
+  flex: none;
   border-radius: var(--radius-sm);
   background-color: var(--accent);
   background-image: url('./assets/logo.jpg');
   background-size: cover;
-  /* 白熊在画面里略偏下，往上挪一点让它在圆形裁切里更居中 */
   background-position: 50% 42%;
-  box-shadow: 0 4px 14px -4px var(--accent-glow), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  box-shadow: 0 3px 10px -3px var(--accent-glow);
+}
+
+.brand-text {
+  min-width: 0;
+  flex: 1;
 }
 
 .brand-title {
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: -0.1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .brand-sub {
-  font-size: 10.5px;
+  font-size: 10px;
   color: var(--text-3);
   margin-top: 2px;
-  max-width: 300px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* 页签做成中置分段控件 */
-.tabs {
-  flex: 1;
-  justify-content: center;
+.theme-btn {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-2);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.theme-btn:hover {
+  border-color: var(--accent);
+  background: var(--bg-elevated);
+}
+
+.nav-block,
+.active-block {
   display: flex;
-  align-items: center;
-  background: rgba(255, 255, 255, 0.3);
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nav-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding: 0 4px;
+}
+
+/* 侧栏竖向导航菜单（保持 .tabs.seg 与 .seg-btn.tab 选择器） */
+.tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
 }
 
 .tabs .tab {
-  height: 28px;
-  padding: 0 18px;
-  font-size: 12px;
-  border-radius: var(--radius-chip);
+  position: relative;
+  width: 100%;
+  height: 34px;
+  padding: 0 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  color: var(--text-2);
 }
 
+.tabs .tab:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.tabs .tab.on {
+  background: var(--bg-surface);
+  border-color: var(--border-hairline);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.tabs .tab.on::before {
+  content: '';
+  position: absolute;
+  left: -1px;
+  top: 7px;
+  bottom: 7px;
+  width: 3.5px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+/* 侧栏底部服务状态与全局统计 */
 .stats {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-hairline);
   display: flex;
-  align-items: center;
-  gap: 18px;
-  flex: none;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
 }
 
 .stat {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xs);
+  padding: 6px 9px;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
-  gap: 2px;
+  gap: 1px;
 }
 
 .stat-k {
   font-size: 10px;
   color: var(--text-3);
-  letter-spacing: 0.3px;
 }
 
 .stat-v {
   font-size: 13px;
   font-weight: 600;
+  color: var(--text);
+}
+
+.stats-foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 2px;
 }
 
 .dot {
@@ -349,14 +645,30 @@ watch(
   border-radius: 50%;
   background: var(--ok);
   box-shadow: 0 0 0 3px var(--ok-ring);
+  flex: none;
 }
 
-/* 自动刷新的可见回执：数字会自己跳，但得让人知道是"活着"还是"冻住了" */
 .auto-hint {
-  font-size: 10px;
+  font-size: 10.5px;
   color: var(--text-3);
-  letter-spacing: 0.2px;
   white-space: nowrap;
+}
+
+.scan-at {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+/* ---------- 右侧主工作台（100% 自适应全宽，不限死最大宽度） ---------- */
+.workspace {
+  min-width: 0;
+  width: 100%;
+  padding: 16px 24px 36px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 100vh;
 }
 
 .toolbar {
@@ -365,26 +677,77 @@ watch(
   gap: 8px;
 }
 
+.status-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  color: var(--text-2);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.status-banner.sb-loading {
+  border-left: 3px solid var(--accent);
+  color: var(--accent);
+}
+
+.status-banner.sb-stale,
+.status-banner.sb-failed {
+  border-left: 3px solid var(--warn);
+  color: var(--warn);
+}
+
 .content {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  /* 撑满剩余高度，让列表页的玻璃面板能铺满可视区而不是底部留白 */
   flex: 1;
   min-height: 0;
+  min-width: 0;
 }
 
+/* 窄屏（含 E2E 的 1150px 窄屏测试）自动折叠为上下结构，保证主内容有充足宽度 */
 @media (max-width: 1180px) {
-  .topbar {
-    flex-wrap: wrap;
+  .app {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    position: relative;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border-hairline);
+    padding: 12px 18px;
+    gap: 10px;
   }
   .tabs {
-    order: 3;
-    width: 100%;
-    flex-basis: 100%;
+    flex-direction: row;
   }
-  .brand-sub {
-    max-width: 180px;
+  .tabs .tab {
+    width: auto;
+    padding: 0 16px;
+    height: 30px;
+  }
+  .tabs .tab.on::before {
+    display: none;
+  }
+  .stats {
+    margin-top: 0;
+    padding-top: 8px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .stats-grid {
+    display: flex;
+    gap: 12px;
+  }
+  .workspace {
+    padding: 14px 18px 32px;
+    min-height: auto;
   }
 }
 </style>

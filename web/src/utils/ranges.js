@@ -20,11 +20,11 @@ export function toDayStr(d) {
 }
 
 /** 起止留空的含义：起点空 = 不限，终点空 = 到今天。
- *  按钮按时间先后从左到右排列：昨天 → 今天 → 近 7 天 → 近 30 天 → 全部。 */
+ *  按钮按时间先后从左到右排列：今天 → 昨天 → 近 7 天 → 近 30 天 → 全部。 */
 export const RANGES = [
+  { label: '今天', range: () => ({ from: toDayStr(daysAgo(0)), to: '' }) },
   // 昨天是**闭区间**，两端都要给："不限 → 昨天"会把今天之前的全部数据都算进来
   { label: '昨天', range: () => ({ from: toDayStr(daysAgo(1)), to: toDayStr(daysAgo(1)) }) },
-  { label: '今天', range: () => ({ from: toDayStr(daysAgo(0)), to: '' }) },
   { label: '近 7 天', range: () => ({ from: toDayStr(daysAgo(7)), to: '' }) },
   { label: '近 30 天', range: () => ({ from: toDayStr(daysAgo(30)), to: '' }) },
   { label: '全部', range: () => ({ from: '', to: '' }) },

@@ -3,26 +3,36 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { api } from '../api.js';
 import { useChart, theme, baseTooltip, baseAxisLabel } from '../composables/useChart.js';
 import { fmtCompact, fmtNum, fmtCredit, fmtPct, fmtTime, fmtSec, fmtSpeed } from '../utils/format.js';
+import { stepTooltipHtml } from '../utils/tooltipHtml.js';
 import KpiCard from './KpiCard.vue';
 import PhaseBar from './PhaseBar.vue';
+import TurnPanel from './TurnPanel.vue';
+import SortTag from './SortTag.vue';
+import {
+  DEFAULT_ORDER,
+  nextOrder,
+  orderedByTime,
+  displayIndexOf,
+  displaySeq,
+} from '../utils/sortOrder.js';
 
 const props = defineProps({ sessionId: String });
 const emit = defineEmits(['close']);
 
 const data = ref(null);
 const error = ref('');
+/** 静默刷新失败：保留上一拍数据，但轮次卡片要把「不是实时」明说 */
+const stale = ref(false);
 
+let sessionVersion = 0;
 watch(
   () => props.sessionId,
   async (id) => {
+    sessionVersion += 1;
     data.value = null;
     error.value = '';
-    if (!id) return;
-    try {
-      data.value = await api.session({ sessionId: id });
-    } catch (e) {
-      error.value = e.message;
-    }
+    stale.value = false;
+    if (id) await silentReload();
   },
   { immediate: true },
 );
@@ -31,16 +41,35 @@ watch(
  * 供 App 的自动刷新调用：只换数据，**不**把 data 置空——
  * 否则每 5 秒抽屉会闪一下空态。出错也保持上一拍的内容，
  * 一次网络抖动不该把整个抽屉清掉。
+ *
+ * 同 URL 的网络去重由 api.js 负责；这里的版本号负责另一件事：
+ * 用户切换会话后，较慢的旧会话响应绝不能盖掉新会话。
  */
 async function silentReload() {
-  if (!props.sessionId) return;
+  const id = props.sessionId;
+  if (!id) return true;
+  const version = sessionVersion;
   try {
-    data.value = await api.session({ sessionId: props.sessionId });
-  } catch {
-    /* 保持上一拍的数据 */
+    const next = await api.sessionDetail({ sessionId: id });
+    if (version !== sessionVersion || props.sessionId !== id) return false;
+    data.value = next;
+    stale.value = false;
+    error.value = '';
+    return true;
+  } catch (e) {
+    if (version === sessionVersion) {
+      stale.value = true;
+      if (!data.value) error.value = e.message;
+      console.warn('[抽屉刷新] 取数失败，保留上一拍数据：', e);
+    }
+    return false;
   }
 }
-defineExpose({ reload: silentReload });
+defineExpose({
+  reload: silentReload,
+  needsRetry: () =>
+    !!(error.value || stale.value || (props.sessionId && data.value?.sessionId !== props.sessionId)),
+});
 
 const s = computed(() => data.value?.summary || {});
 
@@ -68,31 +97,40 @@ const maxToolMs = computed(() => Math.max(1, ...(data.value?.slowTools || []).ma
  *
  * 另外补 dataZoom：300 多次请求挤在 260px 里，一根柱子不到 1px，
  * 不给放大能力就只能看个轮廓。
+ *
+ * ⚠ 长会话（真实数据里最长 1381 次请求）把所有点铺进约 950px 时每点不足 1px；
+ *   缓存命中率又会在某些请求从 99% 骤降到 2% 再立刻弹回（实测 26 处，
+ *   如第 248/249 次：命中 347,136 → 28,672 → 350,208）。平滑的青绿分界线
+ *   在凹口处近乎垂直、半透明面积在同一列反复叠加，看起来像凭空多出一根
+ *   深绿色柱。按结衣的方案：默认只铺前 100 次请求，用底部滚动杆 / 滚轮
+ *   缩放把曲线放宽，凹口就还原成可读的玫红斜坡，而不是一根柱。
  */
 const growthEl = ref(null);
 useChart(growthEl, () => {
   const steps = data.value?.steps || [];
   if (!steps.length) return null; // 空会话不画，交给容器的空态
 
+  /** 默认窗口按「点数」而不是百分比算：会话短就整条铺满，长则固定 100 点 */
+  const WINDOW_POINTS = 100;
+  const zoomEnd = steps.length > WINDOW_POINTS ? (WINDOW_POINTS / steps.length) * 100 : 100;
+
   const axisName = { color: theme.faint, fontSize: 10 };
   return {
-    grid: { left: 8, right: 18, top: 46, bottom: 30, containLabel: true },
+    grid: { left: 8, right: 18, top: 46, bottom: 46, containLabel: true },
     tooltip: {
       ...baseTooltip,
       trigger: 'axis',
       formatter: (ps) => {
         const step = steps[ps[0].dataIndex];
         if (!step) return '';
-        return `<b>第 ${ps[0].dataIndex + 1} 次请求</b> · ${fmtTime(step.ts)}<br/>
-          ${step.toolName ? '工具：<b>' + step.toolName + '</b><br/>' : ''}
-          输入 <b>${fmtNum(step.prompt)}</b>（命中 ${fmtNum(step.cacheRead)}）<br/>
-          输出 <b>${fmtNum(step.completion)}</b>（思考 ${fmtNum(step.reasoning)}）<br/>
-          耗时 <b>${fmtSec(step.durMs)}</b>${step.tps != null ? ` · 吐字 <b>${fmtSpeed(step.tps)}</b> t/s` : ''}<br/>
-          结算 <b>${fmtCredit(step.credit)}</b>`;
+        return stepTooltipHtml(step, ps[0].dataIndex);
       },
     },
     /* 图例居中放顶部，两个轴的名称分列左右两端：
-       原来图例靠右，正好和右轴名「输出」压在同一个角落。 */
+       原来图例靠右，正好和右轴名「输出」压在同一个角落。
+       ⚠ ECharts 图例图标取 series.itemStyle.color，**不取** lineStyle.color：
+       只给 line 设 lineStyle / areaStyle 时，图例会落回默认调色板（蓝 / 黄绿 / 橙），
+       与阶段 2 的新配色对不上。下面三个 series 都显式补一次主色。 */
     legend: { top: 0, left: 'center', itemWidth: 9, itemHeight: 9, textStyle: { color: theme.sub, fontSize: 11 } },
     xAxis: {
       type: 'category',
@@ -118,16 +156,34 @@ useChart(growthEl, () => {
       },
     ],
     dataZoom: [
-      { type: 'inside', xAxisIndex: 0 },
+      {
+        type: 'inside',
+        xAxisIndex: 0,
+        start: 0,
+        end: zoomEnd,
+        zoomOnMouseWheel: true,
+        moveOnMouseMove: true,
+        moveOnMouseWheel: false,
+      },
       {
         type: 'slider',
         xAxisIndex: 0,
-        height: 12,
-        bottom: 2,
-        borderColor: 'transparent',
-        backgroundColor: 'rgba(120,132,156,.08)',
-        fillerColor: 'rgba(31,81,117,.12)',
-        handleStyle: { color: '#1f5175' },
+        /** 短会话本来就没东西可滚，别挂一根无用的杆 */
+        show: steps.length > WINDOW_POINTS,
+        start: 0,
+        end: zoomEnd,
+        height: 16,
+        bottom: 4,
+        borderColor: '#d2c9bc',
+        backgroundColor: 'rgba(126,118,108,.12)',
+        fillerColor: 'rgba(217,38,98,.18)',
+        handleSize: '110%',
+        handleStyle: { color: '#d92662', borderColor: '#d92662' },
+        /** 杆里显示整条曲线的缩略轮廓，拖动时能看见自己翻到了哪一段 */
+        dataBackground: {
+          lineStyle: { color: 'rgba(15,118,110,.55)', width: 1 },
+          areaStyle: { color: 'rgba(15,118,110,.14)' },
+        },
         textStyle: { color: theme.faint, fontSize: 10 },
       },
     ],
@@ -139,10 +195,9 @@ useChart(growthEl, () => {
         yAxisIndex: 0,
         smooth: true,
         symbol: 'none',
-        /* 和总览的主趋势图保持同一套语义配色：命中=浅，未命中=深，输出=赭黄。
-           两处画的是同一组指标，配色必须能对上，否则看的人要重新学一遍。 */
-        areaStyle: { color: 'rgba(77,155,163,.18)' },
-        lineStyle: { color: '#4d9ba3', width: 1.5 },
+        areaStyle: { color: 'rgba(15,118,110,.20)' },
+        lineStyle: { color: '#0f766e', width: 1.5 },
+        itemStyle: { color: '#0f766e' },
         data: steps.map((r) => r.cacheRead),
       },
       {
@@ -152,8 +207,9 @@ useChart(growthEl, () => {
         yAxisIndex: 0,
         smooth: true,
         symbol: 'none',
-        areaStyle: { color: 'rgba(39,97,140,.22)' },
-        lineStyle: { color: '#1f5175', width: 1.5 },
+        areaStyle: { color: 'rgba(217,38,98,.22)' },
+        lineStyle: { color: '#d92662', width: 1.5 },
+        itemStyle: { color: '#d92662' },
         data: steps.map((r) => r.cacheMiss),
       },
       {
@@ -161,7 +217,7 @@ useChart(growthEl, () => {
         type: 'bar',
         yAxisIndex: 1,
         barMaxWidth: 6,
-        itemStyle: { color: 'rgba(184,134,58,.85)', borderRadius: [2, 2, 0, 0] },
+        itemStyle: { color: '#c86d1f', borderRadius: [2, 2, 0, 0] },
         data: steps.map((r) => r.completion),
       },
     ],
@@ -184,8 +240,12 @@ const ROW_H = 34;
 /** 视口外多渲染几行，抵消快速滚动时的白屏 */
 const OVERSCAN = 6;
 
-const steps = computed(() => data.value?.steps || []);
-const maxStepTotal = computed(() => Math.max(1, ...steps.value.map((r) => r.total)));
+/** 上下文增长曲线始终消费后端原始（时间正序）steps：横轴是「第几次请求」，不随表格排序翻转 */
+const rawSteps = computed(() => data.value?.steps || []);
+/** 逐次请求明细默认时间逆序（最新在前）；顶部 Tag 可在正序 / 逆序间切换 */
+const detailOrder = ref(DEFAULT_ORDER);
+const steps = computed(() => orderedByTime(rawSteps.value, detailOrder.value));
+const maxStepTotal = computed(() => Math.max(1, ...rawSteps.value.map((r) => r.total)));
 
 const listEl = ref(null);
 const viewH = ref(380);
@@ -229,6 +289,31 @@ watch(
 function onScroll(e) {
   scrollTop.value = e.target.scrollTop;
 }
+
+/** 轮次视图点「在完整明细中定位」：滚到该轮并把同轮的行标出来。
+ *  两者要一起设：窗口由 scrollTop 驱动，只改 DOM 的 scrollTop 在快速重取时会被拉回。
+ *  下标一律先在原始正序里查、再换算到当前显示顺序，逆序下定位才不会跑到另一轮。 */
+const highlightTurnKey = ref('');
+function locateTurn(turnKey) {
+  const rawIdx = rawSteps.value.findIndex((r) => r.turnKey === turnKey);
+  if (rawIdx < 0) return;
+  highlightTurnKey.value = turnKey;
+  const idx = displayIndexOf(rawIdx, rawSteps.value.length, detailOrder.value);
+  scrollTop.value = Math.max(0, (idx - 2) * ROW_H);
+  if (listEl.value) listEl.value.scrollTop = scrollTop.value;
+}
+
+/** 顶部排序 Tag：切方向后若已有定位高亮，按新顺序重新定位；否则回到第一条 */
+function toggleDetailOrder() {
+  const key = highlightTurnKey.value;
+  detailOrder.value = nextOrder(detailOrder.value);
+  if (key) {
+    locateTurn(key);
+  } else {
+    scrollTop.value = 0;
+    if (listEl.value) listEl.value.scrollTop = 0;
+  }
+}
 </script>
 
 <template>
@@ -249,24 +334,28 @@ function onScroll(e) {
       <div v-else-if="!data" class="empty">加载中…</div>
 
       <div v-else class="body scroll">
+        <!-- 本轮摘要 + 会话内轮次列表。它只消费本抽屉的 data，
+             复用下面的 silentReload()，不新增第二套定时器。 -->
+        <TurnPanel :data="data" :stale="stale" @locate="locateTurn" />
+
         <div class="kpis">
-          <KpiCard label="请求" :value="fmtNum(s.requests)" :sub="`工具调用 ${data.steps.filter((x) => x.toolName).length} 次`" />
-          <KpiCard label="输入" :value="fmtCompact(s.prompt)" :sub="`平均 ${fmtCompact(s.avgPrompt)}`" />
-          <KpiCard label="输出" :value="fmtCompact(s.completion)" :sub="`思考 ${fmtCompact(s.reasoning)}`" />
+          <KpiCard label="请求" :value="fmtNum(s.requests)" :sub="`工具调用 ${data.steps.filter((x) => x.toolName).length} 次`" accent="#1c1917" />
+          <KpiCard label="输入" :value="fmtCompact(s.prompt)" :sub="`平均 ${fmtCompact(s.avgPrompt)}`" accent="#c86d1f" />
+          <KpiCard label="输出" :value="fmtCompact(s.completion)" :sub="`思考 ${fmtCompact(s.reasoning)}`" accent="#4d7c0f" />
           <KpiCard
             label="缓存命中率"
             :value="fmtPct(s.cacheHitRate)"
             :sub="`命中 ${fmtCompact(s.cacheRead)}`"
-            accent="#2c7a83"
+            accent="#0f766e"
             :progress="s.cacheHitRate"
           />
           <KpiCard
             label="吐字速度"
             :value="sp.tps == null ? '—' : `${fmtSpeed(sp.tps)} t/s`"
             :sub="speedSub"
-            accent="#8f6a9e"
+            accent="#6d28d9"
           />
-          <KpiCard label="结算" :value="fmtCredit(s.credit)" :sub="`平均 ${fmtCredit(s.avgCredit)}`" accent="#b8863a" />
+          <KpiCard label="结算" :value="fmtCredit(s.credit)" :sub="`平均 ${fmtCredit(s.avgCredit)}`" accent="#d92662" :hero="true" />
         </div>
 
         <div class="grid2">
@@ -314,8 +403,9 @@ function onScroll(e) {
           <div class="panel-head">
             <div>
               <div class="panel-title">逐次请求明细</div>
-              <div class="panel-sub">{{ steps.length }} 条</div>
+              <div class="panel-sub">{{ steps.length }} 条 · # 为第几次请求，不随排序变化</div>
             </div>
+            <SortTag :order="detailOrder" @toggle="toggleDetailOrder" />
           </div>
           <div ref="listEl" class="scroll" style="max-height: 380px" @scroll.passive="onScroll">
             <table class="steps-table">
@@ -333,7 +423,7 @@ function onScroll(e) {
                   <th class="right">耗时</th>
                   <th class="right">吐字</th>
                   <th class="right">credit</th>
-                  <th style="width: 70px" />
+                  <th style="width: 70px" title="单条规模 = 本条请求的总 token（含输出）÷ 本会话单条最大总 token；反映单次请求的相对大小，只在本会话内横向比较，跨会话不可比">单条规模</th>
                 </tr>
               </thead>
               <tbody>
@@ -342,8 +432,12 @@ function onScroll(e) {
                   <td colspan="13" />
                 </tr>
 
-                <tr v-for="(r, i) in visibleSteps" :key="r.id">
-                  <td class="num muted">{{ winStart + i + 1 }}</td>
+                <tr
+                  v-for="(r, i) in visibleSteps"
+                  :key="r.id"
+                  :class="{ 'turn-hit': r.turnKey === highlightTurnKey }"
+                >
+                  <td class="num muted">{{ displaySeq(winStart + i, steps.length, detailOrder) }}</td>
                   <td class="num muted">{{ fmtTime(r.ts, false) }}</td>
                   <td><span class="tag gray">{{ r.kind }}</span></td>
                   <td>
@@ -394,12 +488,11 @@ function onScroll(e) {
   z-index: 100;
   display: flex;
   justify-content: flex-end;
-  padding: 16px;
-  /* 磨砂遮罩：后面的看板被虚化，抽屉浮在上面 */
-  background: rgba(22, 28, 44, 0.26);
-  backdrop-filter: blur(10px) saturate(140%);
-  -webkit-backdrop-filter: blur(10px) saturate(140%);
-  animation: fade 0.18s ease;
+  padding: 14px;
+  background: rgba(28, 25, 23, 0.38);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: fade 0.16s ease;
 }
 
 @keyframes fade {
@@ -410,44 +503,21 @@ function onScroll(e) {
 
 .drawer {
   position: relative;
-  width: min(1100px, 94vw);
+  width: min(1160px, 95vw);
   height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   border-radius: var(--radius);
-  background: linear-gradient(158deg, rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.7));
-  backdrop-filter: var(--glass-blur-strong);
-  -webkit-backdrop-filter: var(--glass-blur-strong);
-  border: 1px solid rgba(255, 255, 255, 0.85);
-  box-shadow: 0 24px 72px -20px rgba(16, 22, 34, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.95);
-  animation: slide 0.26s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.drawer::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 1px;
-  background: linear-gradient(
-    150deg,
-    rgba(255, 255, 255, 1) 0%,
-    rgba(255, 255, 255, 0.2) 30%,
-    rgba(255, 255, 255, 0.05) 60%,
-    rgba(255, 255, 255, 0.5) 100%
-  );
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  mask-composite: exclude;
-  pointer-events: none;
-  z-index: 2;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  animation: slide 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 @keyframes slide {
   from {
-    transform: translateX(36px) scale(0.985);
+    transform: translateX(32px);
     opacity: 0.4;
   }
 }
@@ -458,15 +528,16 @@ function onScroll(e) {
   justify-content: space-between;
   gap: 16px;
   padding: 15px 20px;
-  border-bottom: 1px solid rgba(120, 132, 156, 0.14);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-hairline);
   position: relative;
   z-index: 3;
 }
 
 .title {
   font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+  font-weight: 700;
+  letter-spacing: 0.1px;
 }
 
 .sub {
@@ -489,11 +560,9 @@ function onScroll(e) {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
   gap: 10px;
-  /* 窄屏换行时各排等高，理由见 KpiCard 的注释 */
   grid-auto-rows: 1fr;
 }
 
-/* 时间去向 / 慢工具：两块并排，行高下限让它们等高 */
 .grid2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -524,7 +593,7 @@ function onScroll(e) {
   border-radius: var(--radius-sm);
 }
 .slow-row + .slow-row {
-  border-top: 1px solid rgba(120, 132, 156, 0.1);
+  border-top: 1px solid var(--border-hairline);
 }
 .slow-row .bar {
   flex: 1;
@@ -538,24 +607,21 @@ function onScroll(e) {
   text-align: right;
 }
 
-/* 抽屉本身已经是玻璃，内部面板不再叠加 backdrop-filter——
-   嵌套模糊既拖性能又会让层次发灰，改成稍实的白底保留层次 */
 .body .panel {
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  background: rgba(255, 255, 255, 0.62);
+  background: var(--bg-surface);
 }
 
-/* 固定行高是窗口化渲染的前提：上下占位行的高度按 ROW_H 折算出来，
-   行高一旦被内容撑开就不再等于 ROW_H，滚动条会跳。
-   34px 足够放下 12px 文字和 tag（约 19px），不会再被内容顶高。 */
+/* 固定行高是窗口化渲染的前提：严格保持 34px */
 .steps-table td {
   height: 34px;
   padding-top: 0;
   padding-bottom: 0;
 }
 
-/* 占位行只负责撑高度：不能有边框、背景和 padding，否则既多算高度又露馅 */
+.steps-table tr.turn-hit td {
+  background: var(--accent-soft);
+}
+
 .steps-table tr.vpad td,
 .steps-table tr.vpad:hover td {
   padding: 0;

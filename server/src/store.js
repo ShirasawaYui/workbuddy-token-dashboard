@@ -32,15 +32,47 @@ export class Store {
     this.phaseIntervals = new Map();
     /** @type {Map<string, object>} model -> 速度画像 */
     this.speedProfiles = new Map();
+    /**
+     * 全量轮次索引（惰性，见下面的 getter）。
+     * 生产 API 从不读它 —— /api/session 为了保证与 summary/steps 同口径，
+     * 会按筛选后的记录自己 buildTurns(list)。只有回归测试会访问这两个索引。
+     */
+    this._turnIndex = null;
+    this._turnsBySession = null;
+    /** @type {Map<string, any>} sessionId -> 该会话按时间升序的记录（第 8 步索引） */
+    this.bySession = new Map();
+    /** 全量按 ts 排好序的记录。rebuild 时排一次，查询不再重复 O(N log N) 排序 */
+    this.sortedRecords = [];
+    /**
+     * 数据版本：只有 rebuild 才会 +1。前端据此判断「这一拍有没有新数据」，
+     * 没变就整拍跳过重绘；lastScanAt 每次扫描都会变，不能当版本号用。
+     */
+    this.revision = 0;
     this.defaultOverheadMs = 0;
     this.lastScanAt = 0;
+    /** 正在进行的 refresh，用于并发去重 */
+    this.refreshing = null;
   }
 
+  /**
+   * 定时扫描与手动 /api/refresh 可能撞在同一拍。
+   * 共享同一个 in-flight Promise：后者直接复用前者的结果，不会有两个 scan
+   * 同时读同一段文件尾巴、也不会重复触发一次全量 rebuild。
+   */
   async refresh() {
-    const changed = await this.scanner.scan();
-    if (changed) this.rebuild();
-    this.lastScanAt = Date.now();
-    return changed;
+    if (this.refreshing) return this.refreshing;
+    const job = (async () => {
+      const changed = await this.scanner.scan();
+      if (changed) this.rebuild();
+      this.lastScanAt = Date.now();
+      return changed;
+    })();
+    this.refreshing = job;
+    try {
+      return await job;
+    } finally {
+      if (this.refreshing === job) this.refreshing = null;
+    }
   }
 
   rebuild() {
@@ -76,16 +108,69 @@ export class Store {
     const { profiles, defaultOverheadMs } = buildSpeedProfiles(all);
     attachSpeeds(all, profiles, defaultOverheadMs);
 
+    // ---------- 轮次维度 ----------
+    // 每条记录贴一个稳定的轮次键，/api/session 的 steps 才能按轮次下钻。
+    // 全量轮次索引改成惰性：10 万条时 buildTurns(all) 会白算 3 万多个轮次
+    // 并整体排序一次，而生产 API 根本不读它。这里只负责让缓存失效。
+    for (const r of all) r.turnKey = turnKeyOf(r);
+    this._turnIndex = null;
+    this._turnsBySession = null;
+
     this.toolCalls = toolCalls;
     this.phases = phases;
     this.phaseIntervals = intervals;
     this.speedProfiles = profiles;
     this.defaultOverheadMs = defaultOverheadMs;
+
+    // ---------- 查询索引（第 8 步）----------
+    // records() 过去每次调用都 [...byId.values()].sort(...)，而一拍里
+    // meta / overview / sessions / session / requests 会各调一次 ——
+    // 10 万条就是 5 次 O(N log N) 复制 + 排序。这里一次排好，查询直接复用。
+    // bySession 让单会话详情只过滤该会话的记录，不必先摊平整段历史。
+    const sorted = all.slice().sort((a, b) => a.ts - b.ts);
+    this.sortedRecords = sorted;
+    const bySession = new Map();
+    for (const r of sorted) {
+      let list = bySession.get(r.sessionId);
+      if (!list) bySession.set(r.sessionId, (list = []));
+      list.push(r);
+    }
+    this.bySession = bySession;
+    this.revision += 1;
   }
 
-  /** 全部记录，按时间升序 */
+  /** 全部记录，按时间升序。返回的是 rebuild 时缓存的数组，调用方不得修改 */
   records() {
-    return [...this.byId.values()].sort((a, b) => a.ts - b.ts);
+    return this.sortedRecords;
+  }
+
+  /** 单个会话的记录（已按时间升序）；单会话查询不必再过滤全历史 */
+  recordsForSession(sessionId) {
+    return this.bySession.get(sessionId) || [];
+  }
+
+  /**
+   * 全量轮次索引：首次访问才构建，rebuild 时只置 null 让它失效。
+   * 独立审计确认生产路由没有任何一处读它们，唯一消费者是轮次回归测试；
+   * 放在 rebuild 里无条件构建属于纯浪费。
+   */
+  get turnIndex() {
+    if (!this._turnIndex) this.#buildTurnIndexes();
+    return this._turnIndex;
+  }
+  get turnsBySession() {
+    if (!this._turnsBySession) this.#buildTurnIndexes();
+    return this._turnsBySession;
+  }
+  #buildTurnIndexes() {
+    const allTurns = buildTurns(this.sortedRecords);
+    this._turnIndex = new Map(allTurns.map((t) => [t.turnKey, t]));
+    const bySid = new Map();
+    for (const t of allTurns) {
+      if (!bySid.has(t.sessionId)) bySid.set(t.sessionId, []);
+      bySid.get(t.sessionId).push(t);
+    }
+    this._turnsBySession = bySid;
   }
 
   sessionList() {
@@ -214,6 +299,126 @@ export function groupBy(records, keyFn) {
     map.get(k).push(r);
   }
   return map;
+}
+
+/* ==========================================================================
+ * 轮次：一轮对话 = 一次用户提问及其所有后续模型/工具调用。
+ *
+ * 口径（执行计划书第 3 节）：
+ *  - 一次 API 请求以 providerData.messageId 为键；Store.byId 已去重
+ *  - 一轮优先按 (sessionId, traceId) 分组，跨会话即便 traceId 相同也不合并
+ *  - 缺失 traceId 的请求各自独立成"未归属请求"，绝不合并成一个空轮
+ *  - 输入已含缓存命中；总 token = 输入 + 输出，不再加一次缓存
+ *  - credit 只累加日志里的 rawUsage.credit，不建价格表
+ *
+ * 刻意接收"记录数组"而不是直接读 Store：/api/session 的 turns 必须与
+ * summary / steps 用同一份筛选后的数据，否则会出现「KPI 是今天的、
+ * 轮次是全历史」的口径分裂。Store 的全量索引也复用这个函数，只有一份聚合逻辑。
+ * ======================================================================== */
+
+/** NUL 做分隔符，避免 sessionId / traceId / messageId 里的字符造成键碰撞 */
+const TURN_SEP = '\u0000';
+
+export function turnKeyOf(r) {
+  const sid = r.sessionId || '';
+  if (r.traceId) return `${sid}${TURN_SEP}${r.traceId}`;
+  return `${sid}${TURN_SEP}__orphan__${TURN_SEP}${r.id || ''}`;
+}
+
+/** 把一组记录聚合成轮次数组，按起始时间升序 */
+export function buildTurns(records) {
+  // 双保险：调用方即使传进重复 messageId，也不会重复计费
+  const seen = new Set();
+  const rows = [];
+  for (const r of records) {
+    if (r.id && seen.has(r.id)) continue;
+    if (r.id) seen.add(r.id);
+    rows.push(r);
+  }
+
+  const out = [];
+  for (const [turnKey, list] of groupBy(rows, turnKeyOf)) {
+    const head = list[0];
+    const isOrphan = !head.traceId;
+    const s = summarize(list);
+    let startTs = Infinity;
+    let endTs = -Infinity;
+    const models = new Set();
+    let toolCalls = 0;
+    for (const r of list) {
+      if (r.ts < startTs) startTs = r.ts;
+      if (r.ts > endTs) endTs = r.ts;
+      if (r.model) models.add(r.model);
+      if (r.kind === 'function_call') toolCalls += 1;
+    }
+    out.push({
+      turnKey,
+      turnId: isOrphan ? `orphan:${head.id}` : head.traceId,
+      traceId: head.traceId || '',
+      sessionId: head.sessionId,
+      isOrphan,
+      requests: s.requests,
+      prompt: s.prompt,
+      completion: s.completion,
+      total: s.total,
+      cacheRead: s.cacheRead,
+      cacheMiss: s.cacheMiss,
+      cacheHitRate: s.cacheHitRate,
+      reasoning: s.reasoning,
+      credit: s.credit,
+      durMs: s.durMs,
+      models: [...models],
+      toolCalls,
+      startTs,
+      endTs,
+      lastTs: endTs,
+    });
+  }
+  return out.sort((a, b) => a.startTs - b.startTs || a.turnId.localeCompare(b.turnId));
+}
+
+/**
+ * 轮次汇总。所有数值都从轮次派生，而不是抄一份 summarize(records)，
+ * 这样「轮次合计 == 所属请求逐项求和」才是真正被检验的等式。
+ * 注意各轮 credit 已各自 round 到 4 位，汇总与全量一次性求和可能有
+ * 0.0001 级舍入差，对账时用容差比较。
+ */
+export function summarizeTurns(turns) {
+  const acc = {
+    turns: turns.length,
+    orphanTurns: 0,
+    requests: 0,
+    prompt: 0,
+    completion: 0,
+    total: 0,
+    cacheRead: 0,
+    cacheMiss: 0,
+    reasoning: 0,
+    credit: 0,
+    maxRequests: 0,
+    latestTurnId: null,
+    latestTs: 0,
+  };
+  for (const t of turns) {
+    acc.requests += t.requests;
+    acc.prompt += t.prompt;
+    acc.completion += t.completion;
+    acc.total += t.total;
+    acc.cacheRead += t.cacheRead;
+    acc.cacheMiss += t.cacheMiss;
+    acc.reasoning += t.reasoning;
+    acc.credit += t.credit;
+    if (t.isOrphan) acc.orphanTurns += 1;
+    if (t.requests > acc.maxRequests) acc.maxRequests = t.requests;
+    if (!acc.latestTurnId || t.lastTs >= acc.latestTs) {
+      acc.latestTurnId = t.turnId;
+      acc.latestTs = t.lastTs;
+    }
+  }
+  acc.credit = round(acc.credit, 4);
+  acc.cacheHitRate = acc.prompt > 0 ? acc.cacheRead / acc.prompt : 0;
+  acc.avgRequests = turns.length ? round(acc.requests / turns.length, 2) : 0;
+  return acc;
 }
 
 /** 按时间分桶（本地时区） */

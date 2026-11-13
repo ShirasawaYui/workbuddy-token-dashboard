@@ -12,7 +12,7 @@
  *   - 工具耗时靠 function_call / function_call_result 的 callId 配对
  *   - 超过 30 分钟的事件间隔会被判定为"离开"，用来还原真实的使用节奏
  *
- * 运行：node scripts/demo.js          生成并启动（http://localhost:5178）
+ * 运行：node scripts/demo.js          生成并启动（http://127.0.0.1:5178）
  *       node scripts/demo.js --gen    只生成数据，不启动服务
  *       DEMO_SEED=42 node scripts/demo.js   固定随机种子（默认固定，输出可复现）
  */
@@ -323,7 +323,7 @@ function serve() {
     stdio: 'inherit',
     env: { ...process.env, WORKBUDDY_HOME: path.join(OUT), PORT: String(port) },
   });
-  console.log(`\n看板地址：http://localhost:${port}  （数据源为演示数据，Ctrl+C 退出）`);
+  console.log(`\n看板地址：http://127.0.0.1:${port}  （数据源为演示数据，Ctrl+C 退出）`);
   child.on('exit', (code) => process.exit(code ?? 0));
 }
 

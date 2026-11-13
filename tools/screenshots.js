@@ -8,7 +8,7 @@
  *   - 数据源是 scripts/demo.js 生成的合成数据（截图不能暴露真实用量）
  *
  * 前置：演示服务已启动（npm run demo 或手动 WORKBUDDY_HOME=<demo> node server/src/index.js）
- * 运行：BASE_URL=http://localhost:5199 node tools/screenshots.js
+ * 运行：BASE_URL=http://127.0.0.1:5199 node tools/screenshots.js
  */
 const fs = require('node:fs');
 const os = require('node:os');
@@ -16,7 +16,7 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 
 const CDP_PORT = Number(process.env.CDP_PORT || 9300 + Math.floor(Math.random() * 600));
-const BASE_URL = process.env.BASE_URL || 'http://localhost:5199';
+const BASE_URL = process.env.BASE_URL || 'http://127.0.0.1:5199';
 const HOST = new URL(BASE_URL).host;
 const OUT_DIR = path.resolve(__dirname, '..', 'docs', 'screenshots');
 fs.mkdirSync(OUT_DIR, { recursive: true });

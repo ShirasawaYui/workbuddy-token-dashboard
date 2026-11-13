@@ -7,7 +7,7 @@
  *  - 耗时部分**重新实现一遍走查算法**，不复用 src/timing.js
  * 两条路径互相独立，结果一致才说明链路没算错。
  *
- * 前提：解析服务已在运行（默认 http://localhost:5178）
+ * 前提：解析服务已在运行（默认 http://127.0.0.1:5178，服务只绑 IPv4 回环）
  * 运行：node test/reconcile.js
  */
 import fs from 'node:fs';
@@ -17,7 +17,7 @@ import { parseChunk } from '../src/parser.js';
 
 const HOME = process.env.WORKBUDDY_HOME || path.join(os.homedir(), '.workbuddy');
 const PROJECTS = path.join(HOME, 'projects');
-const API = process.env.API || 'http://localhost:5178';
+const API = process.env.API || 'http://127.0.0.1:5178';
 
 const byId = new Map();
 /** 每个文件的全量事件，供下方的耗时独立复算使用 */
@@ -211,6 +211,119 @@ if (!stable.length) {
   } else {
     console.log('-'.repeat(96));
     console.log(`✗ 有 ${tbad} 项不一致，请排查 scanner 的事件累积 / timing 的走查逻辑`);
+    process.exit(1);
+  }
+}
+
+/* ==========================================================================
+ * 轮次维度独立对账（第 5 步）
+ *
+ * 刻意**不 import src/store.js**：按 traceId 自己再分一遍组、自己求和，
+ * 才能验证 API 的轮次聚合不是"拿同一份代码验自己"。
+ * 只比静态会话，避免实时写入造成的时序漂移。
+ * ======================================================================== */
+
+/** 独立实现：有 traceId 按 traceId，缺失则按 messageId 各自独立成轮 */
+function independentTurns(rows) {
+  const map = new Map();
+  for (const r of rows) {
+    const key = r.traceId ? r.traceId : 'orphan:' + r.id;
+    if (!map.has(key)) {
+      map.set(key, {
+        turnId: key, requests: 0, prompt: 0, completion: 0, total: 0,
+        cacheRead: 0, cacheMiss: 0, reasoning: 0, credit: 0,
+        startTs: Infinity, endTs: -Infinity,
+      });
+    }
+    const t = map.get(key);
+    t.requests += 1;
+    for (const k of ['prompt', 'completion', 'total', 'cacheRead', 'cacheMiss', 'reasoning', 'credit']) {
+      t[k] += r[k];
+    }
+    t.startTs = Math.min(t.startTs, r.ts);
+    t.endTs = Math.max(t.endTs, r.ts);
+  }
+  for (const t of map.values()) t.credit = Math.round(t.credit * 10000) / 10000;
+  return map;
+}
+
+const bySession = new Map();
+for (const r of all) {
+  if (!bySession.has(r.sessionId)) bySession.set(r.sessionId, []);
+  bySession.get(r.sessionId).push(r);
+}
+
+if (!stable.length) {
+  console.log('\n（没有 60 秒内未变动的会话，跳过轮次对账）');
+} else {
+  const stableIds = new Set(stable.map((f) => f.sessionId));
+  const pad3 = (s, n) => String(s).padEnd(n);
+  const sumBy = (rows, k) => rows.reduce((a, r) => a + r[k], 0);
+
+  console.log('\n=============== 轮次维度对账（独立实现，仅静态会话）===============');
+  console.log(pad3('会话', 40) + pad3('项', 20) + pad3('独立复算', 16) + pad3('看板 API', 16) + '结果');
+  console.log('-'.repeat(100));
+
+  let rbad = 0;
+  let checked = 0;
+  for (const [sid, rows] of bySession) {
+    if (!stableIds.has(sid)) continue;
+    const mine = independentTurns(rows);
+    const res3 = await fetch(`${API}/api/session?sessionId=${encodeURIComponent(sid)}`);
+    if (!res3.ok) {
+      rbad++;
+      console.log(`  ✗ ${sid} 接口失败 HTTP ${res3.status}`);
+      continue;
+    }
+    const s = await res3.json();
+    checked++;
+
+    const apiTurns = new Map((s.turns || []).map((t) => [t.turnId, t]));
+    const got = s.turnSummary || {};
+    const checks = [
+      ['轮次数', mine.size, s.turnTotal],
+      ['轮次请求数合计', rows.length, got.requests],
+      ['轮次输入合计', sumBy(rows, 'prompt'), got.prompt],
+      ['轮次输出合计', sumBy(rows, 'completion'), got.completion],
+      ['轮次总 Token', sumBy(rows, 'total'), got.total],
+      ['轮次缓存命中', sumBy(rows, 'cacheRead'), got.cacheRead],
+      ['轮次缓存未命中', sumBy(rows, 'cacheMiss'), got.cacheMiss],
+      ['轮次 reasoning', sumBy(rows, 'reasoning'), got.reasoning],
+      ['轮次 credit', Math.round(sumBy(rows, 'credit') * 10000) / 10000, got.credit],
+      ['与 summary 请求数一致', s.summary.requests, got.requests],
+      ['轮次列表未被裁剪', false, !!s.turnTruncated],
+    ];
+
+    // 每一轮按 turnId 逐项比对，避免"总数对但分组错"
+    let perTurnBad = 0;
+    for (const [tid, mt] of mine) {
+      const at = apiTurns.get(tid);
+      if (!at) {
+        perTurnBad++;
+        continue;
+      }
+      for (const k of ['requests', 'prompt', 'completion', 'total', 'cacheRead', 'cacheMiss', 'credit']) {
+        if (k === 'credit' ? Math.abs(at[k] - mt[k]) > 0.001 : at[k] !== mt[k]) perTurnBad++;
+      }
+    }
+    checks.push(['逐轮明细不一致项', 0, perTurnBad]);
+
+    for (const [label, a3, b3] of checks) {
+      const ok = label === '轮次 credit' ? Math.abs(a3 - b3) < 0.001 : a3 === b3;
+      if (!ok) rbad++;
+      console.log(
+        pad3('  ' + (label === checks[0][0] ? sid.slice(0, 36) : ''), 40) +
+          pad3(label, 20) + pad3(a3, 16) + pad3(b3, 16) + (ok ? '✓' : '✗ 不一致'),
+      );
+    }
+  }
+
+  if (rbad === 0) {
+    console.log('-'.repeat(100));
+    console.log(`✓ 轮次对账一致：${checked} 个静态会话的轮次划分与全部指标均由独立实现复算吻合`);
+  } else {
+    console.log('-'.repeat(100));
+    console.log(`✗ 有 ${rbad} 项不一致，请排查 buildTurns / traceId 缺失兜底 / API 筛选口径`);
     process.exit(1);
   }
 }

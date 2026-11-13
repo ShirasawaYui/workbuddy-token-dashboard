@@ -21,8 +21,8 @@ const props = defineProps({
   value: { type: String, default: '' },
 });
 
-/** 与总览「时间去向」、图表语义保持一致的三段配色 */
-const COLORS = { model: '#27618c', tool: '#2c7a83', human: '#b8863a' };
+/** 与总览「时间去向」、图表语义保持一致的三段撞色配色 */
+const COLORS = { model: '#d92662', tool: '#0f766e', human: '#c86d1f' };
 
 const active = computed(() => (props.phase ? props.phase.activeMs || 0 : 0));
 

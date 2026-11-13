@@ -14,10 +14,22 @@
     "build": "npm -w web run build",
     "start": "npm -w server run start",
     "demo": "node scripts/demo.js",
+    "demo:live": "node scripts/live-demo.js",
     "preview": "npm -w web run preview",
-    "test": "npm -w server run test",
+    "test": "npm -w server run test && node --test server/test/hardening.test.js server/test/turns.test.js server/test/active.test.js server/test/perf-hardening.test.js server/test/phase1.test.js web/test/tooltip.test.js web/test/turnView.test.js web/test/api.test.js web/test/filters.test.js web/test/sortOrder.test.js",
+    "test:web": "node --test web/test/tooltip.test.js web/test/turnView.test.js web/test/api.test.js web/test/filters.test.js web/test/sortOrder.test.js",
     "test:reconcile": "npm -w server run reconcile",
-    "test:e2e": "node tools/e2e-verify.js"
+    "test:e2e": "node tools/e2e-verify.js",
+    "test:live": "node tools/verify-live.mjs",
+    "test:active": "node tools/verify-active.mjs",
+    "test:large": "node tools/verify-large-list.mjs",
+    "test:final": "node tools/verify-final.mjs",
+    "test:phase1": "node tools/verify-phase1.mjs",
+    "index:rebuild": "node tools/index-rebuild.mjs",
+    "index:verify": "node tools/index-rebuild.mjs --verify",
+    "perf:gen": "node tools/perf-bench.mjs --gen-only",
+    "perf:bench": "node tools/perf-bench.mjs",
+    "perf:compare": "node tools/perf-compare.mjs"
   },
   "engines": {
     "node": ">=20"

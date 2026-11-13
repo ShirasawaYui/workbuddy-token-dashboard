@@ -19,13 +19,15 @@ async function load() {
   try {
     const r = await api.sessions(toParams(props.filter));
     items.value = r.items;
+    return true;
   } catch (e) {
     error.value = e.message;
+    return false;
   }
 }
 
 watch(() => props.filter, load, { deep: true, immediate: true });
-defineExpose({ reload: load });
+defineExpose({ reload: load, needsRetry: () => !!error.value });
 
 const sorted = computed(() => {
   const arr = [...items.value];
@@ -83,6 +85,32 @@ const groups = computed(() => {
 const maxCredit = computed(() => Math.max(1, ...items.value.map((s) => s.credit)));
 const maxGroupCredit = computed(() => Math.max(1, ...groups.value.map((g) => g.credit)));
 
+/* ---------- 大数据渲染上限（第 8 步） ----------
+ * 500+ 会话时全量 v-for 会铺出上万个单元格，且每次取数都整表重绘。
+ * 这里只渲染前 N 行；组头小计仍按**全量** g.sessions 计算，语义不变，
+ * 「显示全部」可一次性放开。会话数不超过阈值时（例如 demo 的 10 个）
+ * 完全不触发截断，行为与原来逐行一致。
+ */
+const renderLimit = ref(200);
+const visibleGroups = computed(() => {
+  let left = renderLimit.value;
+  return groups.value.map((g) => {
+    const shown = left > 0 ? g.sessions.slice(0, left) : [];
+    left = Math.max(0, left - shown.length);
+    return { ...g, visibleSessions: shown, hiddenCount: g.sessions.length - shown.length };
+  });
+});
+const renderedCount = computed(() =>
+  visibleGroups.value.reduce((a, g) => a + g.visibleSessions.length, 0),
+);
+const truncated = computed(() => items.value.length > renderedCount.value);
+function showMore() {
+  renderLimit.value += 200;
+}
+function showAll() {
+  renderLimit.value = Number.MAX_SAFE_INTEGER;
+}
+
 function sortBy(k) {
   if (sortKey.value === k) sortDir.value *= -1;
   else {
@@ -135,11 +163,17 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
         <div class="panel-title">会话列表</div>
         <div class="panel-sub">
           共 {{ items.length }} 个会话 · 按项目归类为 {{ groups.length }} 组 · 点击行查看逐次请求明细
+          <span v-if="truncated"> · 大列表仅渲染前 {{ renderedCount }} 行（组头小计仍按全部会话计算）</span>
         </div>
       </div>
-      <button v-if="groups.length > 1" class="btn ghost" @click="toggleAll">
-        {{ allCollapsed ? '全部展开' : '全部收起' }}
-      </button>
+      <!-- 折叠按钮保持第一位：E2E 用 .panel-head .btn 的第一个来测「全部收起/展开」 -->
+      <div class="head-actions">
+        <button v-if="groups.length > 1" class="btn ghost" @click="toggleAll">
+          {{ allCollapsed ? '全部展开' : '全部收起' }}
+        </button>
+        <button v-if="truncated" class="btn ghost" @click="showMore">显示更多</button>
+        <button v-if="truncated" class="btn ghost" @click="showAll">显示全部</button>
+      </div>
     </div>
 
     <div v-if="error" class="empty">{{ error }}</div>
@@ -166,7 +200,7 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
         </thead>
 
         <!-- 一个项目一个 tbody：组头本身是一行"小计"，数值与下面各列对齐 -->
-        <tbody v-for="g in groups" :key="g.projectId">
+        <tbody v-for="g in visibleGroups" :key="g.projectId">
           <tr class="group-head" @click="toggleGroup(g.projectId)">
             <td>
               <!-- 注意：flex 要放在内层 div 上，直接给 td 设 display:flex
@@ -213,7 +247,7 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
 
           <template v-if="!isCollapsed(g.projectId)">
             <tr
-              v-for="s in g.sessions"
+              v-for="s in g.visibleSessions"
               :key="s.sessionId"
               class="srow"
               @click="emit('open-session', s.sessionId)"
@@ -248,6 +282,12 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
                 <span v-else class="muted">—</span>
               </td>
             </tr>
+            <tr v-if="g.hiddenCount > 0" class="more-row">
+              <td colspan="12">
+                该组还有 {{ g.hiddenCount }} 个会话未渲染
+                <button class="btn ghost" @click="showMore">显示更多</button>
+              </td>
+            </tr>
           </template>
         </tbody>
 
@@ -262,15 +302,34 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
 </template>
 
 <style scoped>
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.more-row > td {
+  padding: 10px 12px 10px 30px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  background: var(--bg-subtle);
+}
+.more-row .btn {
+  height: 24px;
+  padding: 0 9px;
+  font-size: 11px;
+  margin-left: 8px;
+}
 .title-cell {
-  max-width: 260px;
+  max-width: 280px;
 }
 .title {
   display: block;
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 260px;
+  max-width: 280px;
 }
 .sid {
   color: var(--text-3);
@@ -285,16 +344,18 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
   cursor: pointer;
 }
 .group-head > td {
-  background: rgba(255, 255, 255, 0.42);
-  border-bottom: 1px solid rgba(120, 132, 156, 0.2);
-  padding-top: 7px;
-  padding-bottom: 7px;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border-strong);
+  padding-top: 8px;
+  padding-bottom: 8px;
   font-size: 12px;
-  /* 比表头淡、比数据行亮：介于两者之间才是"次级表头" */
   transition: background 0.15s;
 }
+.group-head > td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 .group-head:hover > td {
-  background: rgba(255, 255, 255, 0.66);
+  background: var(--bg-hover);
 }
 .g-name {
   display: flex;
@@ -308,7 +369,7 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
 .g-path {
   font-size: 10px;
   color: var(--text-3);
-  max-width: 190px;
+  max-width: 210px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -316,13 +377,14 @@ const maxGroupActiveMs = computed(() => Math.max(1, ...groups.value.map((g) => g
 /* 展开时朝下（rotate 90°），收起时朝右 */
 .caret {
   display: inline-flex;
-  color: var(--text-3);
+  color: var(--accent);
   transform: rotate(90deg);
   transition: transform 0.18s;
   flex: none;
 }
 .caret.closed {
   transform: rotate(0deg);
+  color: var(--text-3);
 }
 
 /* 组内会话行缩进一档，层级看得出来 */

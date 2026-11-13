@@ -49,13 +49,13 @@ function sharesTo100(parts) {
   return out;
 }
 
-/** 三段：模型生成 / 工具执行 / 人的环节 */
+/** 三段：模型生成 / 工具执行 / 人的环节（阶段 2：树莓玫红 × 冷松石青 × 焦糖琥珀撞色） */
 const segs = computed(() => {
   if (!p.value || !active.value) return [];
   const parts = [
-    { key: 'model', label: '模型生成', ms: p.value.modelMs, color: '#27618c' },
-    { key: 'tool', label: '工具执行', ms: p.value.toolMs, color: '#2c7a83' },
-    { key: 'human', label: '人的环节', ms: p.value.humanMs, color: '#b8863a' },
+    { key: 'model', label: '模型生成', ms: p.value.modelMs, color: '#d92662' },
+    { key: 'tool', label: '工具执行', ms: p.value.toolMs, color: '#0f766e' },
+    { key: 'human', label: '人的环节', ms: p.value.humanMs, color: '#c86d1f' },
   ];
   const pcts = sharesTo100(parts.map((s) => s.ms));
   return parts.map((s, i) => ({ ...s, share: s.ms / active.value, pct: pcts[i] }));

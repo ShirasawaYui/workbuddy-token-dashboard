@@ -13,7 +13,8 @@
  *
  * 运行：node tools/e2e-verify.js
  * 可选环境变量：
- *   BASE_URL  默认 http://localhost:5178
+ *   BASE_URL  默认 http://127.0.0.1:5178
+ *             （解析服务只绑 IPv4 回环；本机 localhost 优先解析成 ::1）
  *   BROWSER   浏览器可执行文件路径
  *   CDP_PORT  默认 9338
  *
@@ -40,7 +41,7 @@ const path = require('node:path');
  * 都是被另一个 run 在同一个页面上乱点造成的）。所以这里取随机端口 + 带端口的 profile。
  */
 const CDP_PORT = Number(process.env.CDP_PORT || 9300 + Math.floor(Math.random() * 600));
-const BASE_URL = process.env.BASE_URL || 'http://localhost:5178';
+const BASE_URL = process.env.BASE_URL || 'http://127.0.0.1:5178';
 const HOST = new URL(BASE_URL).host;
 
 const BROWSER_CANDIDATES = [
@@ -270,6 +271,17 @@ const proc = spawn(
   }
   await sleep(3000);
 
+  // 前端默认档位已改为「今天」，而 demo 夹具今日零点后仅 44 条，撑不起后面
+  // 「明细 50 行」及会话分组 / KPI 等断言。本 E2E 的断言口径建立在「全部」档的全量
+  // 视图上，这里在页面初始化完成后显式切回「全部」，把测试前置条件恢复到全量口径。
+  // 按按钮文本点击，与下面 pickRange('今天') 同一写法，不按索引。
+  await ev(
+    '(function(){var b=[...document.querySelectorAll(".fb-row .seg-btn")]' +
+      '.find(function(x){return x.textContent.trim()===' + JSON.stringify('全部') + ';});' +
+      'if(b)b.click();})()',
+  );
+  await sleep(2500); // 等切档后三视图的请求落地
+
   const V = (i) => 'document.querySelectorAll(".content > *")[' + i + ']';
   // v-show 生效时，未激活的视图 display 为 none，所以可见块数应恒为 1
   const VIS =
@@ -389,6 +401,30 @@ const proc = spawn(
   check('上下文增长曲线 canvas', (await ev('document.querySelectorAll(".drawer canvas").length')) === 1);
   const drows = await ev('document.querySelectorAll(".drawer tbody tr").length');
   check('逐次请求明细 > 0', drows > 0, drows + ' 条');
+
+  /* 顶部排序 Tag：默认时间逆序，点击切正序，再点回逆序。
+     # 始终表示「第几次请求」，所以逆序首行应为总条数、正序首行应为 1。
+     切回逆序才继续后面的轮次定位断言，不改动既有流程的前置状态。 */
+  console.log('【逐次明细排序 Tag】');
+  const dTag = 'document.querySelector(".drawer [data-testid=sort-order]")';
+  check('逐次明细有顶部排序 Tag', await ev('!!' + dTag));
+  check('逐次明细默认时间逆序', (await ev(dTag + '.getAttribute("data-order")')) === 'desc');
+  check('逆序状态明示「最新在前」', (await ev(dTag + '.textContent')).includes('最新在前'));
+  const dTotal = await ev(
+    'Number((document.querySelector(".drawer .steps-table").closest(".panel").querySelector(".panel-sub").textContent.match(/[0-9]+/)||[0])[0])',
+  );
+  const dFirstDesc = await ev('document.querySelector(".drawer .steps-table tbody tr:not(.vpad) td").textContent.trim()');
+  check('逆序首行 # = 总条数', Number(dFirstDesc) === dTotal, `${dFirstDesc} / ${dTotal}`);
+  await ev(dTag + '.click()');
+  await sleep(500);
+  check('点击后逐次明细切为正序', (await ev(dTag + '.getAttribute("data-order")')) === 'asc');
+  check('正序状态明示「最早在前」', (await ev(dTag + '.textContent')).includes('最早在前'));
+  const dFirstAsc = await ev('document.querySelector(".drawer .steps-table tbody tr:not(.vpad) td").textContent.trim()');
+  check('正序首行 # = 1', Number(dFirstAsc) === 1, dFirstAsc);
+  await ev(dTag + '.click()');
+  await sleep(500);
+  check('再点回逆序', (await ev(dTag + '.getAttribute("data-order")')) === 'desc');
+  check('明细内容未被排序清空', (await ev('document.querySelectorAll(".drawer .steps-table tbody tr:not(.vpad)").length')) > 0);
   check('抽屉 KPI 6 个', (await ev('document.querySelectorAll(".drawer .kpi").length')) === 6);
   const dSpeed = await kpiText('document.querySelector(".drawer")', '吐字速度');
   check('抽屉吐字速度 KPI 有值', !!dSpeed && dSpeed !== '—' && /t\/s/.test(dSpeed), String(dSpeed));
@@ -400,8 +436,58 @@ const proc = spawn(
   check('明细行带出耗时', dDur > 0, dDur + ' 行');
   check('抽屉有时间去向', await ev('!!document.querySelector(".drawer .phase .track")'));
   check('抽屉有最慢工具列表', (await ev('document.querySelectorAll(".drawer .slow-row").length')) > 0);
+
+  /* 第 6 步：本轮卡片 + 会话内轮次列表。
+     刻意断言「累计 KPI 仍是 6 张」——本轮指标用 .turn-metric，不能挤进 .kpi。 */
+  console.log('【会话轮次视图】');
+  check('本轮用量卡片存在', await ev('!!document.querySelector(".drawer .turn-current")'));
+  const metricKeys = await ev(
+    '[...document.querySelectorAll(".drawer .turn-metric")].map(function(e){return e.getAttribute("data-k");}).join(",")',
+  );
+  check(
+    '本轮指标 6 项且顺序固定',
+    metricKeys === 'prompt,completion,hitRate,credit,requests,total',
+    String(metricKeys),
+  );
+  check('本轮卡片不占累计 KPI 名额', (await ev('document.querySelectorAll(".drawer .kpi").length')) === 6);
+  check('本轮卡片有活跃/最近状态标签', (await ev('document.querySelectorAll(".drawer .turn-current .tag").length')) > 0);
+  const turnRows = await ev('document.querySelectorAll(".drawer .turn-row").length');
+  check('轮次列表有行', turnRows > 0, turnRows + ' 行');
+  check('轮次表头含命中率', await hasCol('document.querySelector(".drawer .turn-panel")', '命中率'));
+  check('轮次面板声明总轮数', await ev('!!document.querySelector(".drawer .turn-panel[data-turn-total]")'));
+  check('轮次 DOM 受虚拟窗口约束', turnRows <= 30, turnRows + ' 行');
+
+  await ev('document.querySelector(".drawer .turn-row").click()');
+  await sleep(450);
+  check('点击轮次后出现展开明细', await ev('!!document.querySelector(".drawer .turn-detail")'));
+  const detailRows = await ev('document.querySelectorAll(".drawer .turn-detail tbody tr").length');
+  check('展开明细有逐请求行', detailRows > 0, detailRows + ' 行');
+  check(
+    '展开明细提供「在完整明细中定位」',
+    await ev(
+      '[...document.querySelectorAll(".drawer .turn-detail .btn")].some(function(b){return b.textContent.indexOf("定位")>=0;})',
+    ),
+  );
+  await shot('03b-session-turns.png');
+
+  await ev(
+    '[...document.querySelectorAll(".drawer .turn-detail .btn")].find(function(b){return b.textContent.indexOf("定位")>=0;}).click()',
+  );
+  await sleep(350);
+  check(
+    '定位后原逐请求表标出同轮行',
+    (await ev('document.querySelectorAll(".drawer .steps-table tr.turn-hit").length')) > 0,
+  );
+  await ev(
+    '[...document.querySelectorAll(".drawer .turn-detail .btn")].find(function(b){return b.textContent.indexOf("收起")>=0;}).click()',
+  );
+  await sleep(300);
+  check('收起后展开明细消失', (await ev('!!document.querySelector(".drawer .turn-detail")')) === false);
+
   await shot('03-session-detail.png');
-  await ev('document.querySelector(".drawer .btn").click()');
+  // 明确取 head 里的关闭按钮：TurnPanel 展开后也会出现 .btn，
+  // 用 $.drawer .btn 取第一个属于位置依赖，容易被将来插入的按钮打断。
+  await ev('document.querySelector(".drawer .head .btn").click()');
   await sleep(800);
 
   console.log('【明细 tab】');
@@ -410,6 +496,26 @@ const proc = spawn(
   check('仅明细可见', (await ev(VIS)) === 1, '可见块=' + (await ev(VIS)));
   const rrows = await ev(V(2) + '.querySelectorAll("tbody tr").length');
   check('明细行数 = 50（每页）', rrows === 50, rrows + ' 行');
+
+  /* 明细版面：默认仍是时间逆序；点 Tag 后由后端按全局时间正序重新分页，
+     所以首行时间应变成最早的一条，而不是「本页内翻转」。 */
+  console.log('【明细版面排序 Tag】');
+  const rTag = V(2) + '.querySelector("[data-testid=sort-order]")';
+  check('明细版面有顶部排序 Tag', await ev('!!' + rTag));
+  check('明细版面默认时间逆序', (await ev(rTag + '.getAttribute("data-order")')) === 'desc');
+  const rTimeExpr = V(2) + '.querySelector("tbody tr td:nth-child(2)").textContent.trim()';
+  const rFirstDesc = await ev(rTimeExpr);
+  await ev(rTag + '.click()');
+  await sleep(1200);
+  check('点击后明细版面切为正序', (await ev(rTag + '.getAttribute("data-order")')) === 'asc');
+  check('正序状态明示「最早在前」', (await ev(rTag + '.textContent')).includes('最早在前'));
+  const rFirstAsc = await ev(rTimeExpr);
+  check('首行时间按全局顺序变为最早', rFirstAsc < rFirstDesc, `${rFirstDesc} → ${rFirstAsc}`);
+  check('切序后回到第 1 页', (await ev(V(2) + '.querySelector(".pager").textContent')).includes('1 /'));
+  await ev(rTag + '.click()');
+  await sleep(1200);
+  check('再点回逆序', (await ev(rTag + '.getAttribute("data-order")')) === 'desc');
+  check('切回后首行时间恢复', (await ev(rTimeExpr)) === rFirstDesc);
   check('明细有耗时列', await hasCol(V(2), '耗时'));
   check('明细有吐字速度列', await hasCol(V(2), '吐字速度'));
   const rDur = await ev(V(2) + '.querySelector("tbody tr td:nth-child(12)").textContent.trim()');
@@ -495,7 +601,14 @@ const proc = spawn(
   );
   check('重置后项目回到「全部项目」', projText.includes('全部项目'), projText.trim());
   const fromText = await ev('document.querySelectorAll(".filterbar .field.dp")[0].textContent');
-  check('重置后起始日期清空', fromText.includes('不限'), fromText.trim());
+  // 阶段 1：默认档位由「全部」改为「今天」，重置回的是今天零点而不是「不限」。
+  // 这是产品默认值变更导致的**断言语义同步**，不涉及任何硬编码数字，也不放宽校验：
+  // 仍要求「今天」按钮高亮 + 起始日期确实回填了日期，且重置按钮在默认态隐藏。
+  const todayOn = await ev(
+    '[...document.querySelectorAll(".fb-row .seg-btn")].some(function(b){' +
+      'return b.textContent.trim()===' + JSON.stringify('今天') + ' && b.classList.contains("on");})',
+  );
+  check('重置后回到默认「今天」档位', todayOn && /\d+月\d+日/.test(fromText), fromText.trim());
   check('重置按钮自身已隐藏', (await ev('[...document.querySelectorAll(".btn")].some(function(b){return b.textContent.indexOf("重置")>=0;})')) === false);
 
   console.log('【趋势粒度随区间联动】');
@@ -628,6 +741,63 @@ const proc = spawn(
 
   await send('Emulation.clearDeviceMetricsOverride');
   await sleep(600);
+
+  console.log('【最近活跃摘要条】');
+  check('最近活跃摘要条存在', await ev('!!document.querySelector(".active-bar")'));
+  check(
+    '默认处于跟随模式',
+    (await ev('document.querySelector(".active-bar")?.getAttribute("data-mode")')) === 'follow',
+  );
+  check('摘要条指标 4 项', (await ev('document.querySelectorAll(".active-bar .as-metric").length')) === 4);
+  check(
+    '措辞为「最近活跃」，不冒充「当前打开」',
+    await ev(
+      '(function(){var b=document.querySelector(".active-bar");' +
+        'return b.querySelector(".as-title").textContent.trim()==="最近活跃" &&' +
+        'b.querySelector(".as-head .tag").textContent.indexOf("当前")<0;})()',
+    ),
+  );
+  check('已绑定到一个会话', await ev('!!document.querySelector(".active-bar")?.getAttribute("data-session-id")'));
+  const asId = await ev('document.querySelector(".active-bar")?.getAttribute("data-session-id")');
+
+  // 用 IIFE 而不是「箭头函数立即调用」：后者在 Runtime.evaluate 里解析不稳定。
+  const clickSwitch = (label) =>
+    ev(
+      '(function(){var b=[...document.querySelectorAll(".active-bar .as-switch .seg-btn")]' +
+        '.find(function(x){return x.textContent.indexOf(' +
+        JSON.stringify(label) +
+        ')>=0;});if(b){b.click();return true;}return false;})()',
+    );
+  const pinnedClick = await clickSwitch('固定');
+  await sleep(450);
+  const pinnedMode = await ev('document.querySelector(".active-bar")?.getAttribute("data-mode")');
+  check('可切换到固定模式', pinnedMode === 'pinned', 'click=' + pinnedClick + ' mode=' + pinnedMode);
+  check('固定后目标会话不变', (await ev('document.querySelector(".active-bar")?.getAttribute("data-session-id")')) === asId);
+  await clickSwitch('跟随');
+  await sleep(450);
+  check('可切回跟随模式', (await ev('document.querySelector(".active-bar")?.getAttribute("data-mode")')) === 'follow');
+
+  await ev('document.querySelector(".active-bar .as-actions .btn").click()');
+  await sleep(1600);
+  check('「查看详情」复用会话抽屉', await ev('!!document.querySelector(".drawer .turn-current")'));
+  await ev('document.querySelector(".drawer .head .btn").click()');
+  await sleep(500);
+
+  /* 第 8 步：稳定态（无新记录）整拍按 revision 跳过重绘。
+     挂一个 fetch 计数器，静默观察 6.2 秒：只应有 1~2 个 /api/meta，
+     不该再出现 overview / session。demo 数据是静态的，revision 不会变。 */
+  await ev(
+    'window.__reqLog=[];(function(){var f=window.fetch;' +
+      'window.fetch=function(u){try{window.__reqLog.push(String((u&&u.url)||u));}catch(e){}' +
+      'return f.apply(this,arguments);};})()',
+  );
+  await sleep(6200);
+  const reqLog = JSON.parse((await ev('JSON.stringify(window.__reqLog)')) || '[]');
+  check(
+    '稳定态一拍只取 meta，不重取视图数据',
+    reqLog.length > 0 && reqLog.length <= 2 && reqLog.every((u) => u.includes('/api/meta')),
+    reqLog.length + ' 个请求：' + reqLog.join(' , '),
+  );
 
   console.log('【控制台】');
   check('无 error / warning', msgs.length === 0, msgs.length ? JSON.stringify(msgs) : '干净');

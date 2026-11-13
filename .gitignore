@@ -2,5 +2,10 @@ node_modules/
 dist/
 .cache/
 .demo/
+.live/
+.active/
+.perf/
+.final/
+.phase2/
 *.log
 .DS_Store

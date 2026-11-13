@@ -1,9 +1,17 @@
 import { onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue';
 
-// ECharts 按需引入：只注册用到的图表与组件，产物从 1.1MB 降到 ~620KB
+// ECharts 按需引入：只注册用到的图表与组件，产物从 1.1MB 降到 ~690KB（含 dataZoom）
 import * as echarts from 'echarts/core';
 import { BarChart, LineChart, PieChart } from 'echarts/charts';
-import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components';
+import {
+  GridComponent,
+  TooltipComponent,
+  LegendComponent,
+  // ⚠ 不注册这两个，option 里的 dataZoom 会被 ECharts **静默忽略**：
+  // 滚动杆不渲染、默认窗口也不生效，全部点照旧铺满（不报错，极难发现）。
+  DataZoomInsideComponent,
+  DataZoomSliderComponent,
+} from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 
 echarts.use([
@@ -13,31 +21,30 @@ echarts.use([
   GridComponent,
   TooltipComponent,
   LegendComponent,
+  DataZoomInsideComponent,
+  DataZoomSliderComponent,
   CanvasRenderer,
 ]);
 
-/** 统一图表风格（浅色 + 玻璃） */
+/** 统一图表风格（暖砂羊皮纸 / 深焙黑曜石双主题兼容） */
 export const theme = {
-  text: '#14171f',
-  sub: '#4d5665',
-  // 和 style.css 的 --text-3 保持一致（原来 #8b95a6 在面板上只有 2.8:1）
-  faint: '#5f6b82',
-  grid: 'rgba(120,132,156,.16)',
-  axis: 'rgba(120,132,156,.3)',
+  text: '#1c1917',
+  sub: '#57524b',
+  faint: '#7e766c',
+  grid: 'rgba(126,118,108,.16)',
+  axis: 'rgba(126,118,108,.32)',
 };
 
-/** 与页面玻璃面板一致的浮层 tooltip */
+/** 与页面暖砂卡片一致的浮层 tooltip */
 export const baseTooltip = {
-  backgroundColor: 'rgba(255,255,255,.88)',
-  borderColor: 'rgba(255,255,255,.9)',
+  backgroundColor: 'rgba(251,249,245,.96)',
+  borderColor: '#cfc6b8',
   borderWidth: 1,
   padding: [9, 12],
   textStyle: { color: theme.text, fontSize: 12 },
   extraCssText: [
-    'backdrop-filter:blur(24px) saturate(180%)',
-    '-webkit-backdrop-filter:blur(24px) saturate(180%)',
-    'box-shadow:0 12px 32px -8px rgba(16,22,34,.22), inset 0 1px 0 rgba(255,255,255,.95)',
-    'border-radius:12px',
+    'box-shadow:0 12px 32px -8px rgba(28,25,23,.18)',
+    'border-radius:10px',
   ].join(';'),
 };
 
@@ -70,6 +77,20 @@ export function useChart(elRef, optionGetter) {
     if (!chart) return;
     const option = optionGetter();
     if (!option) return;
+    /**
+     * 5s 轮询重绘用 notMerge=true 才能清掉旧 series，但它也会顺手把用户
+     * 拖动的 dataZoom 窗口冲掉 —— 「翻到第 500 次请求」下一拍就被拉回 #1。
+     * 先把当前窗口取出来并回新 option，拖到哪儿就停在哪儿。
+     * 切会话时容器被销毁重建，新实例没有旧窗口，自然回到默认区间。
+     */
+    const prevZoom = chart.getOption()?.dataZoom;
+    if (Array.isArray(prevZoom) && Array.isArray(option.dataZoom)) {
+      option.dataZoom = option.dataZoom.map((z, i) => {
+        const s = prevZoom[i]?.start;
+        const e = prevZoom[i]?.end;
+        return Number.isFinite(s) && Number.isFinite(e) ? { ...z, start: s, end: e } : z;
+      });
+    }
     chart.setOption(option, true);
   }
 

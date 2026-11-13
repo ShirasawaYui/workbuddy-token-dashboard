@@ -3,6 +3,8 @@ import { computed, ref, watch } from 'vue';
 import { api, toParams } from '../api.js';
 import { fmtNum, fmtCredit, fmtPct, fmtTime, fmtSec, fmtSpeed } from '../utils/format.js';
 import AppSelect from '../components/ui/AppSelect.vue';
+import SortTag from '../components/SortTag.vue';
+import { DEFAULT_ORDER, nextOrder } from '../utils/sortOrder.js';
 
 const props = defineProps({ filter: Object });
 const emit = defineEmits(['open-session']);
@@ -12,6 +14,8 @@ const size = ref(50);
 const data = ref({ items: [], total: 0 });
 const error = ref('');
 const expanded = ref(new Set());
+/** 明细版面默认时间逆序（与既有行为一致）；顶部 Tag 可切到正序 */
+const order = ref(DEFAULT_ORDER);
 
 const SIZE_OPTIONS = [
   { value: 50, label: '50 / 页' },
@@ -22,15 +26,26 @@ const SIZE_OPTIONS = [
 async function load() {
   error.value = '';
   try {
-    data.value = await api.requests({ ...toParams(props.filter), page: page.value, size: size.value });
+    data.value = await api.requests({ ...toParams(props.filter), page: page.value, size: size.value, order: order.value });
+    return true;
   } catch (e) {
     error.value = e.message;
+    return false;
   }
 }
 
+/* 排序方向参与取数：必须让后端按全局时间顺序分页，只在前端翻转当前页会
+   变成「第一页是最新的一批、但页内从旧到新」，跨页顺序自相矛盾。
+   page / size / order 放同一个 watch，切换排序时两个变化合并成一次请求。 */
 watch(() => props.filter, () => { page.value = 1; load(); }, { deep: true, immediate: true });
-watch([page, size], load);
-defineExpose({ reload: load });
+watch([page, size, order], load);
+defineExpose({ reload: load, needsRetry: () => !!error.value });
+
+/** 换顺序后回到第 1 页：停在第 8 页看「最早在前」没有意义 */
+function toggleOrder() {
+  order.value = nextOrder(order.value);
+  page.value = 1;
+}
 
 const totalPages = computed(() => Math.max(1, Math.ceil(data.value.total / size.value)));
 
@@ -52,6 +67,7 @@ function toggle(id) {
         </div>
       </div>
       <div class="pager">
+        <SortTag :order="order" @toggle="toggleOrder" />
         <AppSelect
           :model-value="size"
           :options="SIZE_OPTIONS"
@@ -92,20 +108,25 @@ function toggle(id) {
               <td class="muted" style="text-align: center">{{ expanded.has(r.id) ? '▾' : '▸' }}</td>
               <td class="num">{{ fmtTime(r.ts) }}</td>
               <td class="cell-title" :title="r.title">{{ r.title || r.sessionId.slice(0, 8) }}</td>
-              <td class="mono">{{ r.model }}</td>
-              <td><span class="tag gray">{{ r.kind }}</span></td>
+              <td><span class="tag gray mono">{{ r.model }}</span></td>
+              <td><span class="tag" :class="r.kind === 'function_call' ? 'teal' : 'gray'">{{ r.kind }}</span></td>
               <td>
                 <span v-if="r.toolName" class="tag">{{ r.toolName }}</span>
                 <span v-else class="muted">—</span>
               </td>
               <td class="right num">{{ fmtNum(r.prompt) }}</td>
-              <td class="right num" :style="{ color: r.prompt && r.cacheRead / r.prompt > 0.9 ? '#12885a' : undefined }">
+              <td class="right num" :style="{ color: r.prompt && r.cacheRead / r.prompt > 0.9 ? 'var(--teal)' : undefined, fontWeight: r.prompt && r.cacheRead / r.prompt > 0.9 ? 600 : undefined }">
                 {{ fmtPct(r.prompt ? r.cacheRead / r.prompt : 0, 0) }}
               </td>
               <td class="right num">{{ fmtNum(r.completion) }}</td>
               <td class="right num muted">{{ fmtNum(r.reasoning) }}</td>
               <td class="right num">{{ fmtNum(r.total) }}</td>
-              <td class="right num" :title="`含每请求固定开销 ${fmtSec(r.overheadMs)}`">{{ fmtSec(r.durMs) }}</td>
+              <td class="right num" :title="`含每请求固定开销 ${fmtSec(r.overheadMs)}`">
+                <span class="stat-bar-cell">
+                  <i class="v-bar" :class="r.durMs >= 10000 ? 'rose' : r.durMs >= 4000 ? 'amber' : 'teal'" />
+                  {{ fmtSec(r.durMs) }}
+                </span>
+              </td>
               <td class="right num">
                 <span
                   v-if="r.tps == null"
@@ -117,7 +138,12 @@ function toggle(id) {
                   title="瞬时速度，用「耗时 − 该模型每请求固定开销」当分母。净出字时长里仍含处理输入的时间，所以未命中缓存输入很大的请求读数会偏低；看模型的平均速度请用总览的模型明细"
                 >{{ fmtSpeed(r.tps) }} <span class="unit">t/s</span></span>
               </td>
-              <td class="right num"><b>{{ fmtCredit(r.credit) }}</b></td>
+              <td class="right num">
+                <span class="stat-bar-cell">
+                  <i class="v-bar" :class="r.credit >= 3 ? 'rose' : r.credit >= 1 ? 'amber' : 'teal'" />
+                  <b>{{ fmtCredit(r.credit) }}</b>
+                </span>
+              </td>
             </tr>
             <tr v-if="expanded.has(r.id)" class="detail-row">
               <td />
@@ -168,12 +194,13 @@ function toggle(id) {
   align-items: center;
 }
 .cell-title {
-  max-width: 200px;
+  max-width: 240px;
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .detail-row td {
-  background: rgba(255, 255, 255, 0.5);
+  background: var(--bg-subtle);
   padding: 0;
 }
 .detail {
@@ -182,7 +209,7 @@ function toggle(id) {
   gap: 8px 28px;
   padding: 13px 16px;
   align-items: center;
-  border-left: 2px solid var(--accent-line);
+  border-left: 3px solid var(--accent);
 }
 .detail > div {
   display: flex;

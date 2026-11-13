@@ -10,7 +10,8 @@ import AppSelect from './ui/AppSelect.vue';
 import AppDatePicker from './ui/AppDatePicker.vue';
 import { colorOf } from '../utils/format.js';
 import { allowedGranularities, spanDaysOf } from '../utils/granularity.js';
-import { RANGES, CUSTOM_PRESET } from '../utils/ranges.js';
+import { RANGES, CUSTOM_PRESET, rangeOfPreset } from '../utils/ranges.js';
+import { defaultFilter } from '../composables/useFilterStorage.js';
 
 const props = defineProps({
   filter: { type: Object, required: true },
@@ -110,21 +111,46 @@ const granNote = computed(() => {
   return `区间 ${spanText}，粒度已按区间限定`;
 });
 
-const hasFilter = computed(
-  () =>
-    (props.filter.projectId && props.filter.projectId !== 'all') ||
-    (props.filter.model && props.filter.model !== 'all') ||
-    (props.filter.kind && props.filter.kind !== 'all') ||
-    !!props.filter.keyword ||
-    !!props.filter.from ||
-    !!props.filter.to,
-);
+/**
+ * 是否「有筛选」。阶段 1 默认档位改成「今天」后，from 自带今天的日期、不再为空，
+ * 若还用 !!filter.from 判断，用户什么都没改也会常驻「· 已应用筛选」和「重置」按钮。
+ * 因此改成与 defaultFilter() 逐字段比对：默认档位自带的 from/to 不算用户筛选。
+ */
+const hasFilter = computed(() => {
+  const d = defaultFilter();
+  const f = props.filter;
+  return (
+    f.preset !== d.preset ||
+    f.from !== d.from ||
+    f.to !== d.to ||
+    (f.projectId && f.projectId !== 'all') ||
+    (f.model && f.model !== 'all') ||
+    (f.kind && f.kind !== 'all') ||
+    !!f.keyword
+  );
+});
+
+/**
+ * 「当前已加载范围」的交代（口径 A：全局元数据随加载范围越用越准）。
+ * meta 缺 loadedFiles / totalFiles（例如服务未启动、meta 为空对象或旧后端）时返回空串，
+ * 不渲染、不常驻；fullLoad 或已全部加载时同样隐藏。
+ */
+const loadedRange = computed(() => {
+  const m = props.meta || {};
+  const loaded = Number(m.loadedFiles);
+  const total = Number(m.totalFiles);
+  if (!Number.isFinite(loaded) || !Number.isFinite(total)) return '';
+  if (m.fullLoad || loaded >= total) return '';
+  return `已加载 ${loaded} / ${total} 个文件`;
+});
 
 function reset() {
+  // 重置回默认「今天」档位；区间用 rangeOfPreset 重算，别写死日期。
+  const today = rangeOfPreset('今天');
   emit('update:filter', {
-    preset: '全部',
-    from: '',
-    to: '',
+    preset: '今天',
+    from: today.from,
+    to: today.to,
     projectId: 'all',
     model: 'all',
     kind: 'all',
@@ -202,6 +228,8 @@ function reset() {
         <span v-if="hasFilter" class="muted">· 已应用筛选</span>
       </span>
 
+      <span v-if="loadedRange" class="loaded-range" data-testid="loaded-range">{{ loadedRange }}</span>
+
       <!-- 沿用上次筛选时给个交代：不然用户会以为筛选是自己冒出来的 -->
       <span v-if="restored" class="restored">
         已沿用今天用过的筛选
@@ -247,41 +275,50 @@ function reset() {
 
 <style scoped>
 .filterbar {
-  padding: 11px 14px 12px;
+  padding: 10px 14px;
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: 8px;
 }
 
-/* 两行之间用极淡的分隔，而不是让 flex 自己折行 */
 .fb-row {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
 .fb-row.secondary {
-  padding-top: 9px;
-  border-top: 1px solid rgba(120, 132, 156, 0.12);
+  padding-top: 8px;
+  border-top: 1px solid var(--border-hairline);
 }
 
 .row-label {
-  font-size: 10px;
+  font-size: 10.5px;
+  font-weight: 500;
   color: var(--text-3);
-  letter-spacing: 0.3px;
+  letter-spacing: 0.2px;
 }
 
-/* 粒度被区间限定时的说明，跟着粒度控件走 */
 .gran-note {
   font-size: 10.5px;
   color: var(--text-3);
 }
 
+.loaded-range {
+  font-size: 10.5px;
+  color: var(--text-2);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  padding: 2px 8px;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+
 .vsep {
   width: 1px;
-  height: 22px;
-  background: linear-gradient(180deg, transparent, rgba(120, 132, 156, 0.3), transparent);
+  height: 20px;
+  background: var(--border-hairline);
   flex: none;
 }
 
@@ -298,7 +335,7 @@ function reset() {
 .range-hint {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   font-size: 11px;
   color: var(--text-2);
   padding-left: 4px;
@@ -326,7 +363,7 @@ function reset() {
   gap: 5px;
   height: 22px;
   padding: 0 6px 0 9px;
-  border-radius: var(--radius-chip);
+  border-radius: 99px;
   font-size: 10.5px;
   color: var(--accent);
   background: var(--accent-soft);
@@ -353,22 +390,20 @@ function reset() {
   display: flex;
   align-items: center;
   gap: 7px;
-  height: 32px;
+  height: 31px;
   padding: 0 10px;
-  width: 232px;
-  border: 1px solid rgba(255, 255, 255, 0.7);
+  width: 240px;
+  border: 1px solid var(--ctl-border);
   border-radius: var(--radius-xs);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(255, 255, 255, 0.5));
-  backdrop-filter: blur(12px) saturate(160%);
-  -webkit-backdrop-filter: blur(12px) saturate(160%);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  background: var(--bg-subtle);
   color: var(--text-3);
-  transition: border-color 0.18s, box-shadow 0.18s;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 
 .search:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  background: var(--ctl-bg);
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
 .search.filled {
@@ -385,8 +420,6 @@ function reset() {
   border-radius: 0;
   background: none;
   box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
   font-size: 12px;
   color: var(--text);
 }
