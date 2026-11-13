@@ -1,5 +1,3 @@
-![WorkBuddy Token 用量看板](web/src/assets/logo.jpg)
-
 # WorkBuddy Token 用量看板
 
 **解析 WorkBuddy 本地会话日志，把 token 消耗、缓存命中、credit 结算与响应速度还原成一张看得懂的看板**
