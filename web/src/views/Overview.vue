@@ -370,7 +370,7 @@ useChart(toolEl, () => {
           label="请求总数"
           :value="fmtNum(s.requests)"
           :sub="`平均 ${fmtCompact(s.avgPrompt)} 输入 / ${fmtNum(s.avgCompletion)} 输出`"
-          accent="#1c1917"
+          accent="var(--kpi-ink)"
         />
         <KpiCard
           label="Token 总量"

@@ -86,7 +86,10 @@ function toEvent(o) {
 /**
  * 解析一份 JSONL 文本块，返回 { records, meta, events }。
  * @param {string} text 文本内容（必须是完整的行，末尾可以没有换行）
- * @param {object} ctx  { projectId, sessionId, cwd }
+ * @param {object} ctx  { projectId, sessionId, cwd, isSubagent, agentId }
+ *   isSubagent=true 时 ctx.sessionId 是**父会话** ID：子代理会话写在
+ *   <父会话>/subagents/agent-*.jsonl 里，行内 o.sessionId 是它自己的内部
+ *   会话 ID（另一个命名空间），归账一律算到父会话头上。
  */
 export function parseChunk(text, ctx) {
   const records = [];
@@ -109,7 +112,47 @@ export function parseChunk(text, ctx) {
     // 会话元信息
     if (o.type === 'ai-title' && o.aiTitle) meta.title = o.aiTitle;
     if (o.cwd) meta.cwd = o.cwd;
-    if (o.sessionId) meta.sessionId = o.sessionId;
+    if (o.sessionId && !ctx.isSubagent) meta.sessionId = o.sessionId;
+
+    /**
+     * credit-usage：团队成员（子代理）消耗的**结算镜像行**。
+     * WorkBuddy 5.x 起写在父会话文件里，只有 credit 一个数字，token 明细
+     * 在 subagents/ 的会话文件里（同一笔钱的两种记法，messageId 互不重叠）。
+     * 这里合成一条「只有 credit」的记录，供**没有 subagent 文件**的会话兜底
+     * 不丢钱；有 subagent 文件的会话由 scanner.all() 丢弃本行（防双计）。
+     */
+    if (o.type === 'credit-usage') {
+      const pd = o.providerData || {};
+      const credit = num(pd.credit);
+      if (credit > 0) {
+        records.push({
+          // CU 行的 pd.messageId 会重复（一条请求多段结算），必须用行级 id
+          id: o.id || `${pd.messageId || 'cu'}#${records.length}`,
+          sessionId: ctx.isSubagent ? ctx.sessionId : (o.sessionId || ctx.sessionId),
+          projectId: ctx.projectId,
+          cwd: o.cwd || ctx.cwd || '',
+          ts: num(o.timestamp),
+          kind: 'credit-usage',
+          toolName: null,
+          model: 'unknown',
+          modelName: '',
+          traceId: pd.traceId || '',
+          requestId: pd.conversationRequestId || '',
+          prompt: 0,
+          completion: 0,
+          total: 0,
+          cacheRead: 0,
+          cacheMiss: 0,
+          reasoning: 0,
+          credit,
+          /** 标记镜像行：subagent 文件已给全量明细的会话里丢弃它 */
+          creditOnly: true,
+          isSubAgent: true,
+          agent: pd.source === 'team_member' ? 'team-member' : (pd.source || ''),
+        });
+      }
+      continue;
+    }
 
     const ev = toEvent(o);
     if (ev) events.push(ev);
@@ -117,18 +160,24 @@ export function parseChunk(text, ctx) {
     const usage = extractUsage(o);
     if (!usage) continue;
 
+    const pd = o.providerData || {};
+    const isSub = ctx.isSubagent === true || pd.isSubAgent === true;
     records.push({
       id: usage.id,
-      sessionId: o.sessionId || ctx.sessionId,
+      // 子代理文件的行内 sessionId 是子代理自己的内部 ID，归账必须落到父会话
+      sessionId: ctx.isSubagent ? ctx.sessionId : (o.sessionId || ctx.sessionId),
       projectId: ctx.projectId,
       cwd: o.cwd || ctx.cwd || '',
       ts: num(o.timestamp),
       kind: o.type || 'unknown', // function_call / message
       toolName: o.name || null,
-      model: (o.providerData && o.providerData.model) || 'unknown',
-      modelName: (o.providerData && o.providerData.requestModelName) || '',
-      traceId: (o.providerData && o.providerData.traceId) || '',
-      requestId: (o.providerData && o.providerData.conversationRequestId) || '',
+      model: pd.model || 'unknown',
+      modelName: pd.requestModelName || '',
+      traceId: pd.traceId || '',
+      requestId: pd.conversationRequestId || '',
+      /** 子代理标记：文件在 subagents/ 下，或行内 isSubAgent=true */
+      isSubAgent: isSub,
+      agent: isSub ? (pd.agent || ctx.agentId || '') : '',
       ...usage,
     });
   }

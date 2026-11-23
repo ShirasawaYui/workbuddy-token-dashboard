@@ -16,7 +16,7 @@
     "demo": "node scripts/demo.js",
     "demo:live": "node scripts/live-demo.js",
     "preview": "npm -w web run preview",
-    "test": "npm -w server run test && node --test server/test/hardening.test.js server/test/turns.test.js server/test/active.test.js server/test/perf-hardening.test.js server/test/phase1.test.js web/test/tooltip.test.js web/test/turnView.test.js web/test/api.test.js web/test/filters.test.js web/test/sortOrder.test.js",
+    "test": "npm -w server run test && node --test server/test/hardening.test.js server/test/turns.test.js server/test/active.test.js server/test/perf-hardening.test.js server/test/phase1.test.js server/test/subagent.test.js web/test/tooltip.test.js web/test/turnView.test.js web/test/api.test.js web/test/filters.test.js web/test/sortOrder.test.js",
     "test:web": "node --test web/test/tooltip.test.js web/test/turnView.test.js web/test/api.test.js web/test/filters.test.js web/test/sortOrder.test.js",
     "test:reconcile": "npm -w server run reconcile",
     "test:e2e": "node tools/e2e-verify.js",

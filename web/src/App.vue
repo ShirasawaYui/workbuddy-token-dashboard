@@ -58,6 +58,15 @@ const restoredHint = ref(boot.restored);
 const pollStale = ref(false);
 /** 是否成功连上过解析服务：服务从未启动（meta 为空）时不常驻显示任何状态提示 */
 const connected = computed(() => !!meta.value?.projectsDir && !meta.value?.error);
+/** 品牌副标题（项目数据目录）：按路径分隔符切段插 <wbr>，窄侧栏里整条路径铺开换行而非省略折叠 */
+const brandSubText = computed(() =>
+  meta.value.error ? '未连接到解析服务' : meta.value.projectsDir || '读取中…'
+);
+const brandSubSegs = computed(() => {
+  const t = brandSubText.value;
+  // 仅对盘符开头的路径按 \ 与 / 切段；错误/占位文案整段返回
+  return /^[A-Za-z]:[\\/]/.test(t) ? t.split(/(?<=[\\/])/) : [t];
+});
 /** 历史数据加载提示：'' 无 | 'loading' 正在读取 | 'failed' 读取未成功 */
 const historyState = ref('');
 let historyTimer = null;
@@ -322,11 +331,11 @@ watch(
     <aside class="sidebar">
       <div class="brand-row">
         <div class="brand">
-          <div class="logo" role="img" aria-label="白熊图标" />
+          <div class="logo" role="img" aria-label="品牌头像" />
           <div class="brand-text">
             <div class="brand-title">WorkBuddy Token 用量看板</div>
-            <div class="brand-sub mono" :title="meta.projectsDir">
-              {{ meta.error ? '未连接到解析服务' : meta.projectsDir || '读取中…' }}
+            <div class="brand-sub mono" :title="brandSubText">
+              <template v-for="(seg, i) in brandSubSegs" :key="i">{{ seg }}<wbr /></template>
             </div>
           </div>
         </div>
@@ -463,20 +472,25 @@ watch(
 
 .brand-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
 }
 
+/*
+ * 桌面窄侧栏（252px）：品牌区改为「头像 + 主题钮」一行 + 标题/路径整行铺开，
+ * 标题单行完整显示，路径沿分隔符换行铺开 —— 不再省略折叠（窄屏 ≤1180px 时回落单行内联）。
+ */
 .brand {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 10px;
   min-width: 0;
   flex: 1;
 }
 
-/* 品牌图标：保留 src/assets/logo.jpg（白熊） */
+/* 品牌图标：src/assets/logo.jpg（罐装啤酒少女，900×900 方图） */
 .logo {
   width: 34px;
   height: 34px;
@@ -485,37 +499,38 @@ watch(
   background-color: var(--accent);
   background-image: url('./assets/logo.jpg');
   background-size: cover;
-  background-position: 50% 42%;
+  background-position: 50% 50%;
   box-shadow: 0 3px 10px -3px var(--accent-glow);
 }
 
 .brand-text {
   min-width: 0;
-  flex: 1;
+  flex: 1 0 100%; /* 独占整行：文字铺开到头像下方的全宽 */
 }
 
 .brand-title {
   font-size: 13px;
   font-weight: 700;
   letter-spacing: -0.1px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: keep-all; /* 需要换行时断在「Token」与「用量看板」之间 */
+  line-height: 1.35;
 }
 
 .brand-sub {
   font-size: 10px;
   color: var(--text-3);
   margin-top: 2px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: break-word; /* 路径按 <wbr> 分段换行铺开，不再省略折叠 */
+  line-height: 1.55;
 }
 
 .theme-btn {
   width: 30px;
   height: 30px;
   flex: none;
+  margin-top: 2px; /* 与 34px 头像光学居中对齐 */
   border-radius: var(--radius-xs);
   border: 1px solid var(--border-strong);
   background: var(--bg-surface);
@@ -722,6 +737,22 @@ watch(
     border-bottom: 1px solid var(--border-hairline);
     padding: 12px 18px;
     gap: 10px;
+  }
+  /* 顶栏横排：宽度充裕，品牌区回落「头像 | 文字 | 主题钮」单行内联 */
+  .brand-row {
+    align-items: center;
+  }
+  .brand {
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 10px;
+  }
+  .brand-text {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .theme-btn {
+    margin-top: 0;
   }
   .tabs {
     flex-direction: row;

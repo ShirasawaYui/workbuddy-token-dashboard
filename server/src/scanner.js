@@ -21,6 +21,27 @@ export function maxTsOf(arr, key) {
 const DAY = 86400_000;
 
 /**
+ * 递归收集目录下的 .jsonl（深度限 4，防意外循环/超深）。
+ * 目录不存在返回 []——subagents/ 是 WorkBuddy 5.x 才有的布局。
+ */
+async function walkJsonl(dir, depth = 0) {
+  const out = [];
+  if (depth > 4) return out;
+  let entries;
+  try {
+    entries = await fsp.readdir(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...(await walkJsonl(p, depth + 1)));
+    else if (e.isFile() && e.name.endsWith('.jsonl')) out.push(p);
+  }
+  return out;
+}
+
+/**
  * 增量扫描器（阶段 1 增加「冷 / 热 / 已加载」三态）。
  *
  * JSONL 是追加写的：文件变大 = 有新内容，可以只读尾巴。
@@ -47,10 +68,13 @@ export class Scanner {
     fileCacheDir = null,
     forceFullLoad = FORCE_FULL_LOAD,
     hotDays = COLD_START_HOT_DAYS,
+    projectsDir = PROJECTS_DIR,
   } = {}) {
     /** @type {Map<string, object>} filePath -> 文件条目（含冷文件） */
     this.files = new Map();
     this.fileCacheDir = fileCacheDir;
+    /** 测试可指向夹具目录；生产默认真实 PROJECTS_DIR */
+    this.projectsDir = projectsDir;
     /** FORCE_FULL_LOAD=1 / 索引损坏时，所有文件都当热文件，回退全量路径 */
     this.forceFullLoad = forceFullLoad;
     this.hotDays = hotDays;
@@ -79,32 +103,53 @@ export class Scanner {
     return t >= Date.now() - this.hotDays * DAY;
   }
 
-  /** 递归找出所有会话 JSONL */
+  /** 递归找出所有会话 JSONL（含 <会话>/subagents/ 下的子代理会话） */
   async discover() {
     const out = [];
     let projects = [];
     try {
-      projects = await fsp.readdir(PROJECTS_DIR, { withFileTypes: true });
+      projects = await fsp.readdir(this.projectsDir, { withFileTypes: true });
     } catch {
       return out;
     }
 
     for (const p of projects) {
       if (!p.isDirectory()) continue;
-      const dir = path.join(PROJECTS_DIR, p.name);
-      let files = [];
+      const dir = path.join(this.projectsDir, p.name);
+      let entries = [];
       try {
-        files = await fsp.readdir(dir);
+        entries = await fsp.readdir(dir, { withFileTypes: true });
       } catch {
         continue;
       }
-      for (const f of files) {
-        if (!f.endsWith('.jsonl')) continue; // 跳过 .file-rollback.ndjson 等
-        out.push({
-          filePath: path.join(dir, f),
-          projectId: p.name,
-          sessionId: f.replace(/\.jsonl$/, ''),
-        });
+      for (const e of entries) {
+        if (e.isFile()) {
+          if (!e.name.endsWith('.jsonl')) continue; // 跳过 .file-rollback.ndjson 等
+          out.push({
+            filePath: path.join(dir, e.name),
+            projectId: p.name,
+            sessionId: e.name.replace(/\.jsonl$/, ''),
+            isSubagent: false,
+          });
+          continue;
+        }
+        if (!e.isDirectory()) continue;
+        /**
+         * <sessionId>/subagents/ 下任意层级的 .jsonl —— WorkBuddy 5.x 起子代理
+         * （Agent 派生的后台队友）的会话写在这里，每条请求都带 rawUsage；父会话
+         * 同名 .jsonl 只留结算镜像（credit-usage）。旧版单层扫描永远看不到这个
+         * 目录，子代理的 token / credit 因此整块隐形。这里递归收进来，归到父会话。
+         */
+        const subFiles = await walkJsonl(path.join(dir, e.name, 'subagents'));
+        for (const filePath of subFiles) {
+          out.push({
+            filePath,
+            projectId: p.name,
+            sessionId: e.name, // 归到父会话
+            isSubagent: true,
+            agentId: path.basename(filePath).replace(/\.jsonl$/, ''),
+          });
+        }
       }
     }
     return out;
@@ -138,7 +183,7 @@ export class Scanner {
   }
 
   /** 冷文件条目：只有 stat 指纹，没有任何解析结果 */
-  #coldEntry(st, { filePath, projectId, sessionId }) {
+  #coldEntry(st, { filePath, projectId, sessionId, isSubagent, agentId }) {
     return {
       size: st.size,
       offset: 0,
@@ -153,6 +198,8 @@ export class Scanner {
       projectId,
       sessionId,
       filePath,
+      isSubagent: !!isSubagent,
+      agentId: agentId || '',
     };
   }
 
@@ -161,11 +208,11 @@ export class Scanner {
    * 异常直接冒泡给 ensureLoaded，下一拍可重试 —— 否则一次抖动会变成永久漏数据。
    */
   async #parseFull(info, st, prev) {
-    const { filePath, projectId, sessionId } = info;
+    const { filePath, projectId, sessionId, isSubagent, agentId } = info;
     const text = await fsp.readFile(filePath, 'utf8');
     const cut = text.lastIndexOf('\n');
     const usable = cut >= 0 ? text.slice(0, cut + 1) : '';
-    const { records, meta, events } = parseChunk(usable, { projectId, sessionId });
+    const { records, meta, events } = parseChunk(usable, { projectId, sessionId, isSubagent, agentId });
     const offset = Buffer.byteLength(usable, 'utf8');
     const next = {
       size: st.size,
@@ -181,6 +228,8 @@ export class Scanner {
       projectId,
       sessionId,
       filePath,
+      isSubagent: !!isSubagent,
+      agentId: agentId || '',
     };
     // 复用同一个对象引用：ensureLoaded 手里拿的 entry 也能立刻看到 loaded=true
     if (prev) Object.assign(prev, next);
@@ -190,7 +239,7 @@ export class Scanner {
     return true;
   }
 
-  async #syncFile({ filePath, projectId, sessionId }) {
+  async #syncFile({ filePath, projectId, sessionId, isSubagent, agentId }) {
     let st;
     try {
       st = await fsp.stat(filePath);
@@ -200,7 +249,7 @@ export class Scanner {
     if (!st.isFile()) return false;
 
     const prev = this.files.get(filePath);
-    const info = { filePath, projectId, sessionId };
+    const info = { filePath, projectId, sessionId, isSubagent, agentId };
 
     // 冷文件：只更新指纹，不 readFile、不 parseChunk（R1 的关键分支）
     // 指纹变化不算 changed，否则有会话在写就会每拍 rebuild + revision 抖动。
@@ -242,7 +291,7 @@ export class Scanner {
         return false;
       }
       const usable = chunk.slice(0, cut + 1);
-      const { records, meta, events } = parseChunk(usable, { projectId, sessionId });
+      const { records, meta, events } = parseChunk(usable, { projectId, sessionId, isSubagent, agentId });
       prev.records.push(...records);
       prev.events.push(...events);
       Object.assign(prev.meta, meta);
@@ -378,8 +427,26 @@ export class Scanner {
      */
     const timelines = [];
 
+    /**
+     * 已加载子代理文件的父会话集合：这些会话的 credit-usage 镜像行
+     * （creditOnly）必须丢弃——subagent 文件已给全量明细，两路都算会双计。
+     * 用「已加载」而不是「存在」：镜像行在明细加载完成前先兜底显示，
+     * 明细一到就换轨，任何一拍 rebuild 都不会两路同时在场。
+     */
+    const withSubagentFiles = new Set();
     for (const f of this.files.values()) {
-      records.push(...f.records);
+      if (f.isSubagent && f.loaded) withSubagentFiles.add(f.sessionId);
+    }
+
+    for (const f of this.files.values()) {
+      for (const r of f.records) {
+        if (r.creditOnly && withSubagentFiles.has(r.sessionId)) continue;
+        records.push(r);
+      }
+      // 子代理文件：请求行已归父会话（records 里 sessionId 就是父 ID），但
+      //   - 事件不并入父时间线——耗时按"相邻事件时间差"推导，跨并行流会算错；
+      //   - 会话元信息行由父文件提供，这里不再重复推会话。
+      if (f.isSubagent) continue;
       const events = f.events || [];
       // 没有任何用量记录、也没有事件的会话才跳过。
       // 只按 records 判会把"只有工具调用、没有用量行"的会话整条丢掉，
@@ -397,6 +464,22 @@ export class Scanner {
         sessionId: f.sessionId,
         projectId: f.projectId,
         events,
+      });
+    }
+
+    // 兜底：只有子代理记录在场（父文件还没加载/没有）的会话也要有会话行，
+    // 否则标题回填与会话列表都会缺这一条。
+    const seen = new Set(sessions.map((s) => s.sessionId));
+    for (const r of records) {
+      if (seen.has(r.sessionId)) continue;
+      seen.add(r.sessionId);
+      sessions.push({
+        sessionId: r.sessionId,
+        projectId: r.projectId,
+        title: '',
+        cwd: r.cwd || '',
+        cwdPretty: r.cwd || decodeProjectDir(r.projectId),
+        filePath: '',
       });
     }
 

@@ -19,7 +19,7 @@
 ---
 
 仓库：[ShirasawaYui/workbuddy-token-dashboard](https://github.com/ShirasawaYui/workbuddy-token-dashboard)。
-这是基于 [selennac/workbuddy-token-dashboard](https://github.com/selennac/workbuddy-token-dashboard) 的 **MIT 二次开发版本**，保留了基底的数据口径与推导算法，重写了前端视觉与布局，并补上冷启动按需加载、明细排序等能力；原作者的版权与许可声明完整保留，详见[来源与二次开发](#来源与二次开发)。
+这是基于 [selennac/workbuddy-token-dashboard](https://github.com/selennac/workbuddy-token-dashboard) 的 **MIT 二次开发版本**，保留了基底的数据口径与推导算法，重写了前端视觉与布局，并补上冷启动按需加载、明细排序、子代理消耗归账等能力；原作者的版权与许可声明完整保留，详见[来源与二次开发](#来源与二次开发)。开箱即用的 Windows 发布包见 [Releases](https://github.com/ShirasawaYui/workbuddy-token-dashboard/releases)。
 
 WorkBuddy 本身不提供任何 token 用量视图。这个项目直接读取它在本地落盘的会话 JSONL（`~/.workbuddy/projects/**/*.jsonl`），起一个**零三方依赖**的解析服务和一个 Vue 3 看板，回答四个平时根本没法回答的问题：
 
@@ -51,8 +51,9 @@ WorkBuddy 本身不提供任何 token 用量视图。这个项目直接读取它
 | **前端视觉** | 树莓玫红 × 松石青 × 焦糖琥珀 × 桑葚紫撞色；KPI 卡左侧彩色竖条、XTHUB 风细线表格与胶囊徽标、Bento 非对称双栏；`<select>` / `<input type="date">` 全部换成自绘控件 |
 | **冷启动按需加载** | 启动只解析近 7 天有写入的文件，其余只登记 stat 指纹；切到更宽档位时按双边界补齐，配「正在读取历史数据」提示与脱敏索引（见[冷启动按需加载](#冷启动按需加载)） |
 | **明细排序** | 会话抽屉「逐次请求明细」与工作台「明细」版面各加一个顶部 Tag，默认时间逆序，点击切正 / 逆序（见[明细排序（两处）](#明细排序两处)） |
+| **子代理消耗归账** | WorkBuddy 5.x 起 Agent 派生的子代理会话写在 `<父会话>/subagents/` 子目录，旧口径整块隐形；现在递归发现并归账到父会话，token / credit 不再漏计，明细带「子代理」标签（见[数据从哪来](#数据从哪来)） |
 | **长会话可读性** | 上下文增长曲线默认只铺 100 个请求点，底部滚动杆带全长缩略轮廓；5 秒重绘保留用户拖到的窗口；图例配色与主图一致 |
-| **工程与回归** | 10 万请求级性能加固、`revision` 稳定态跳过重绘、按需加载索引与安全边界、单测 66 / 浏览器 E2E 119 项，全程控制台 `0 error / 0 warning` |
+| **工程与回归** | 10 万请求级性能加固、`revision` 稳定态跳过重绘、按需加载索引与安全边界、单测 74 / 浏览器 E2E 119 项，全程控制台 `0 error / 0 warning` |
 
 一键启动、命令清单与验证结果见[快速开始](#快速开始)与[测试](#测试)。
 
@@ -237,10 +238,12 @@ WorkBuddy 把每个工作区的会话记录写成追加式 JSONL：
 
 ```
 ~/.workbuddy/projects/<项目目录名>/<sessionId>.jsonl
+~/.workbuddy/projects/<项目目录名>/<sessionId>/subagents/agent-*.jsonl
 ```
 
 - `<项目目录名>` 是 cwd 的编码形式（如 `d-CODE-MyApp` 对应 `D:\code\MyApp`），目录名只是兜底，每行里的 `cwd` 字段才是真值
 - 追加写：文件只会变长，不会原地改写——这决定了可以增量解析
+- `subagents/` 是 WorkBuddy 5.x 起的子代理（Agent 派生的后台队友）会话目录，每个 `agent-*.jsonl` 是一份完整的请求明细；看板递归发现后**归账到父会话**，记录带 `isSubAgent` / `agent` 标记，明细里显示「子代理」标签。父会话文件里的 `credit-usage` 行是这些消耗的结算镜像，只作无明细时的兜底，与明细同场时自动去重，不会双计
 
 每一行是一个 JSON 对象，`type` 取值：
 
@@ -253,6 +256,7 @@ WorkBuddy 把每个工作区的会话记录写成追加式 JSONL：
 | `function_call` | 工具调用，**大部分用量在这里** |
 | `function_call_result` | 工具返回 |
 | `file-history-snapshot` | 文件快照 |
+| `credit-usage` | 子代理消耗的结算镜像行（`providerData.credit`）；有 `subagents/` 明细时被去重，仅作兜底 |
 
 token 用量只挂在有真实请求的行上，位置是 `providerData.rawUsage`：
 
@@ -412,7 +416,7 @@ credit 和 token 数不成正比——一个真实例子：`kimi-k3-1` 6 次请�
 ## 测试
 
 ```bash
-npm test               # 全套单测：解析/耗时/边界/轮次/最近活跃/API 去重/tooltip 转义/排序换算（66 项）
+npm test               # 全套单测：解析/耗时/边界/轮次/最近活跃/API 去重/tooltip 转义/排序换算/子代理归账（74 项）
 npm run test:web       # 只跑前端纯函数单测
 npm run test:reconcile # 独立全量解析 vs 看板 API 对账；含轮次独立复算（需服务在跑）
 npm run test:e2e       # 真实浏览器渲染 + 逐项交互断言（119 项，需先 build）
@@ -540,7 +544,7 @@ npm run perf:compare   # 将首次终端基线与指定 tag 的最终基准做�
 - 虚拟窗口因 sticky 表头有约 1 行系统性偏移（`OVERSCAN=6` 兜住，不露白）；`turnLimit` 尾部裁剪时保持滚动位置会看到行内容左移；卡片与列表行的「活跃」判定在 5 分钟边界可能差一帧。
 - ECharts 的图表配色常量目前按亮色主题定义，暗色主题下坐标轴文字与网格线仍沿用亮色取值，对比度不如 CSS 部分；这是已知的视觉债，后续可改为读取 CSS 变量。
 - ECharts tooltip 无鼠标悬停级交互断言，改用真实模板输出 + 浏览器 `innerHTML` 的确定性探针；优化前基准 JSON 已丢失，对照脚本明确标注数值来源为首次终端输出。
-- 交付的是本地 Web 应用与 `web/dist` 构建产物，**不制作 exe**；`web/dist` 不入库，源码与文档已推送到[公开仓库](https://github.com/ShirasawaYui/workbuddy-token-dashboard)，未创建 Release。
+- 交付的是本地 Web 应用与 `web/dist` 构建产物，**不制作 exe**；`web/dist` 不入库，源码与文档已推送到[公开仓库](https://github.com/ShirasawaYui/workbuddy-token-dashboard)，开箱即用的 Windows 压缩包见 [Releases](https://github.com/ShirasawaYui/workbuddy-token-dashboard/releases)。
 
 后续增强项见[路线图](#路线图)，均不在本次交付范围内。
 
@@ -560,6 +564,7 @@ server/                     零三方依赖的解析服务
   test/incremental.test.js  增量解析单测 + 耗时推导单测
   test/active.test.js       最近活跃会话口径单测
   test/phase1.test.js       冷热三态 / 双边界 / 故障语义 / 索引 / 口径恒等单测
+  test/subagent.test.js     子代理发现 / 归父 / 防双计 / 镜像兜底单测
   test/perf-hardening.test.js 查询索引与 revision 的口径 / 行为单测
   test/reconcile.js         与独立全量解析对账（含耗时维度的独立复算）
 web/                        Vue3 + Vite + ECharts
@@ -586,6 +591,7 @@ tools/verify-active.mjs     多会话交替追加 + 跟随 / 固定 + 无 credit
 tools/verify-large-list.mjs 500 会话的真实 DOM 上限、显示更多 / 全部与分组折叠
 tools/verify-final.mjs      边界、本地安全与敏感数据集成验证
 tools/verify-phase1.mjs     冷启动 / 按需加载 / 索引 / 安全 / 前端提示服务链路验证
+tools/verify-subagents.mjs  子代理归账与镜像防双计的真实数据核对（可复跑）
 tools/index-rebuild.mjs     索引重建与校验 CLI（非 HTTP，不占端口）
 tools/perf-bench.mjs        10 万请求级合成数据生成 + 冷启动 / API / 追加 / 内存基准
 tools/perf-compare.mjs      性能前后对照（明确标注优化前基线来源）
@@ -611,7 +617,7 @@ docs/screenshots/           README 截图（合成数据，不含真实用量）
 
 本项目基于 [selennac/workbuddy-token-dashboard](https://github.com/selennac/workbuddy-token-dashboard)（MIT，Copyright (c) 2026 阿比白熊）做二次开发，原 `LICENSE` 完整保留，本仓库同样以 MIT 开放。
 
-在基底之上完成的工作包括：暖砂亮色 / 深焙暗色双主题与全宽工作台布局、耗时与轮次口径的一系列修正、10 万请求级性能加固、冷启动按近 7 天加载 + 切档按需补齐与脱敏索引、会话轮次与最近活跃视图、两处明细的时间正 / 逆序切换，以及相应的单元 / 端到端回归。上游仓库在 Git 中保留为 `upstream` remote，便于日后同步；本仓库作为独立版本维护，不是上游的补丁分支。
+在基底之上完成的工作包括：暖砂亮色 / 深焙暗色双主题与全宽工作台布局、耗时与轮次口径的一系列修正、10 万请求级性能加固、冷启动按近 7 天加载 + 切档按需补齐与脱敏索引、会话轮次与最近活跃视图、两处明细的时间正 / 逆序切换、子代理会话（`subagents/`）的递归发现与消耗归账，以及相应的单元 / 端到端回归。上游仓库在 Git 中保留为 `upstream` remote，便于日后同步；本仓库作为独立版本维护，不是上游的补丁分支。
 
 ## 贡献
 

@@ -58,6 +58,9 @@ html[data-theme='light'] {
   --text-2: #57524b;
   --text-3: #7e766c;
 
+  /* 中性墨色：总览「请求总数」卡专用（数字/竖条/圆点同色；亮=近黑，暗=淡黄白） */
+  --kpi-ink: #1c1917;
+
   /* 兼容既有类名的面板与控件变量 */
   --glass-bg: #fbf9f5;
   --glass-bg-strong: #ffffff;
@@ -136,6 +139,9 @@ html[data-theme='dark'] {
   --text: #f3ede4;
   --text-2: #b8b0a6;
   --text-3: #8a8177;
+
+  /* 中性墨色：暗色下用偏亮的淡黄白，避免近黑元素在深底上隐形 */
+  --kpi-ink: #f6f0da;
 
   --glass-bg: #1e1b18;
   --glass-bg-strong: #282420;
@@ -446,6 +452,13 @@ tbody tr:hover td {
   background: var(--teal-soft);
   border-color: var(--teal-edge);
   color: var(--teal);
+}
+
+/* 子代理（Agent 派生的后台队友）标记 */
+.tag.plum {
+  background: var(--plum-soft);
+  border-color: var(--plum-edge);
+  color: var(--plum);
 }
 
 .tag.warn {

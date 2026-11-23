@@ -109,7 +109,14 @@ function toggle(id) {
               <td class="num">{{ fmtTime(r.ts) }}</td>
               <td class="cell-title" :title="r.title">{{ r.title || r.sessionId.slice(0, 8) }}</td>
               <td><span class="tag gray mono">{{ r.model }}</span></td>
-              <td><span class="tag" :class="r.kind === 'function_call' ? 'teal' : 'gray'">{{ r.kind }}</span></td>
+              <td>
+                <span class="tag" :class="r.kind === 'function_call' ? 'teal' : 'gray'">{{ r.kind }}</span>
+                <span
+                  v-if="r.isSubAgent"
+                  class="tag plum"
+                  :title="`子代理${r.agent ? '：' + r.agent : ''}（Agent 派生的后台队友）。消耗已归入所属会话`"
+                >子代理</span>
+              </td>
               <td>
                 <span v-if="r.toolName" class="tag">{{ r.toolName }}</span>
                 <span v-else class="muted">—</span>

@@ -520,12 +520,21 @@ const routes = {
         cacheMiss: r.cacheMiss,
         reasoning: r.reasoning,
         credit: round(r.credit, 4),
+        /** 子代理请求（Agent 派生的队友）标记，前端打「子代理」标签 */
+        isSubAgent: !!r.isSubAgent,
+        agent: r.agent || '',
         /** 与 turns[].turnKey 对应，前端可直接在本地 steps 里按轮次下钻 */
         turnKey: r.turnKey,
         ...timingFields(r),
       })),
-      /** 上下文增长曲线：输入 token 随轮次的爬升，能直观看出"上下文膨胀" */
-      contextGrowth: list.map((r, i) => ({ index: i + 1, ts: r.ts, prompt: r.prompt })),
+      /**
+       * 上下文增长曲线：输入 token 随轮次的爬升，能直观看出"上下文膨胀"。
+       * 子代理行/结算镜像行排除：它们是各自独立的上下文（或只有 credit），
+       * 混进单会话曲线会让爬升图失真。
+       */
+      contextGrowth: list
+        .filter((r) => !r.isSubAgent && !r.creditOnly)
+        .map((r, i) => ({ index: i + 1, ts: r.ts, prompt: r.prompt })),
       /** 本会话：时间去向 + 工具耗时 + 单次最慢 */
       phase: store.phases.get(sessionId) || null,
       toolTime: toolStats(calls).slice(0, 15),
@@ -568,6 +577,9 @@ const routes = {
         cacheRead: r.cacheRead,
         reasoning: r.reasoning,
         credit: round(r.credit, 4),
+        /** 子代理请求（Agent 派生的队友）标记，前端打「子代理」标签 */
+        isSubAgent: !!r.isSubAgent,
+        agent: r.agent || '',
         ...timingFields(r),
       })),
     };

@@ -257,6 +257,11 @@ function resetWindows() {
                   <span>{{ labelOf(listWin.start + i) }}</span>
                   <span v-if="t.isOrphan" class="tag warn">未归属</span>
                   <span v-else-if="isActiveTurn(t)" class="tag">活跃</span>
+                  <span
+                    v-if="t.isSubAgent"
+                    class="tag plum"
+                    :title="`子代理轮次${t.agents && t.agents.length ? '：' + t.agents.join('、') : ''}（Agent 派生的后台队友）。消耗已归入本会话`"
+                  >子代理</span>
                 </div>
                 <div class="turn-id mono" :title="t.turnId">{{ t.turnId }}</div>
               </td>

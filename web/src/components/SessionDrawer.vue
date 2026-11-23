@@ -439,12 +439,19 @@ function toggleDetailOrder() {
                 >
                   <td class="num muted">{{ displaySeq(winStart + i, steps.length, detailOrder) }}</td>
                   <td class="num muted">{{ fmtTime(r.ts, false) }}</td>
-                  <td><span class="tag gray">{{ r.kind }}</span></td>
+                  <td>
+                    <span class="tag gray">{{ r.kind }}</span>
+                    <span
+                      v-if="r.isSubAgent"
+                      class="tag plum"
+                      :title="`子代理${r.agent ? '：' + r.agent : ''}（Agent 派生的后台队友）。消耗已归入本会话`"
+                    >子代理</span>
+                  </td>
                   <td>
                     <span v-if="r.toolName" class="tag">{{ r.toolName }}</span>
                     <span v-else class="muted">—</span>
                   </td>
-                  <td class="mono">{{ r.model }}</td>
+                  <td class="mono" :title="r.isSubAgent && r.agent ? `子代理：${r.agent}` : undefined">{{ r.model }}</td>
                   <td class="right num">{{ fmtNum(r.prompt) }}</td>
                   <td class="right num" :style="{ color: r.prompt && r.cacheRead / r.prompt > 0.9 ? '#12885a' : undefined }">
                     {{ fmtPct(r.prompt ? r.cacheRead / r.prompt : 0, 0) }}

@@ -357,6 +357,9 @@ export function buildTurns(records) {
       traceId: head.traceId || '',
       sessionId: head.sessionId,
       isOrphan,
+      /** 子代理轮次（Agent 派生的后台队友）：与主线轮次同属父会话 */
+      isSubAgent: list.some((r) => r.isSubAgent),
+      agents: [...new Set(list.map((r) => r.agent).filter(Boolean))],
       requests: s.requests,
       prompt: s.prompt,
       completion: s.completion,
