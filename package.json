@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-token-dashboard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "解析 WorkBuddy 本地 JSONL 会话日志，统计 token 用量与结算 credit 的看板",
   "workspaces": [
